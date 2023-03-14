@@ -8,8 +8,8 @@
     "InstructionSet": "x86-64",
     "Manufacturer": {{ processor['vendor']|string|tojson }},
     "Model": {{ processor['model']|string|tojson }},
-    "TotalCores": {{ processor['cores']|string|tojson }},
-    "TotalThreads": {{ processor['threads']|string|tojson }},
+    "TotalCores": {{ processor['cores']|int|tojson }},
+    "TotalThreads": {{ processor['threads']|int|tojson }},
     "Status": {
         "@odata.type": "#Resource.Status",
         "State": "Enabled",

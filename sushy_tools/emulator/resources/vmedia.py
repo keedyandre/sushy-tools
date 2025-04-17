@@ -13,6 +13,7 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+import abc
 import collections
 import os
 import re
@@ -37,7 +38,7 @@ Certificate = collections.namedtuple(
 _CERT_ID = "Default"
 
 
-class StaticDriver(base.DriverBase):
+class BaseDriver(base.DriverBase):
     """Redfish virtual media simulator."""
 
     def __init__(self, config, logger):
@@ -196,29 +197,110 @@ class StaticDriver(base.DriverBase):
         del device_info["Certificate"]
         self._devices[(identity, device)] = device_info
 
-    def _write_from_response(self, image_url, rsp, tmp_file):
-        with open(tmp_file.name, 'wb') as fl:
-            for chunk in rsp.iter_content(chunk_size=8192):
-                if chunk:
-                    fl.write(chunk)
+    @abc.abstractmethod
+    def insert_image(self, identity, device, image_url,
+                     inserted=True, write_protected=True,
+                     username=None, password=None):
+        """Upload, remove or insert virtual media
 
-        local_file = None
+        :param identity: parent resource ID
+        :param device: device name
+        :param image_url: URL to ISO image to place into `device` or `None`
+            to eject currently present media
+        :param inserted: treat currently present media as inserted or not
+        :param write_protected: prevent write access the inserted media
+        :raises: `FishyError` if image can't be manipulated
+        """
 
-        content_dsp = rsp.headers.get('content-disposition')
-        if content_dsp:
-            local_file = re.findall('filename="(.+)"', content_dsp)
+    @abc.abstractmethod
+    def eject_image(self, identity, device):
+        """Eject virtual media image
 
-        if local_file:
-            local_file = local_file[0]
+        :param identity: parent resource ID
+        :param device: device name
+        :raises: `FishyError` if image can't be manipulated
+        """
 
-        if not local_file:
-            parsed_url = urlparse.urlparse(image_url)
-            local_file = os.path.basename(parsed_url.path)
+    def _get_image(self, image_url, auth, verify_media_cert, custom_cert):
+        """Get image
 
-        if not local_file:
-            local_file = 'image.iso'
+        :param image_url: Image URL
+        :param auth: Authentication
+        :param verify_media_cert: Verify media certificate
+        :param custom_cert: Custom certificate
+        :raises: `FishyError` if image download fails
+        """
+        if custom_cert is not None:
+            custom_cert_file = tempfile.NamedTemporaryFile(mode='wt')
+            custom_cert_file.write(custom_cert)
+            custom_cert_file.flush()
+            verify_media_cert = custom_cert_file.name
 
-        return local_file
+        try:
+            with requests.get(image_url,
+                              stream=True,
+                              auth=auth,
+                              verify=verify_media_cert) as rsp:
+                if rsp.status_code >= 400:
+                    self._logger.error(
+                        'Failed fetching image from URL %s: '
+                        'got HTTP error %s:\n%s',
+                        image_url, rsp.status_code, rsp.text)
+                    target_code = 502 if rsp.status_code >= 500 else 400
+                    raise error.FishyError(
+                        "Cannot download virtual media: got error %s "
+                        "from the server" % rsp.status_code, code=target_code)
+
+                with tempfile.NamedTemporaryFile(
+                        mode='w+b', delete=False) as tmp_file:
+                    local_file = _write_from_response(image_url, rsp, tmp_file)
+                    temp_dir = tempfile.mkdtemp(
+                        dir=os.path.dirname(tmp_file.name))
+                    local_file_path = os.path.join(temp_dir, local_file)
+
+                os.rename(tmp_file.name, local_file_path)
+        except error.FishyError as ex:
+            msg = 'Failed fetching image from URL %s: %s' % (image_url, ex)
+            self._logger.error(msg)
+            raise  # leave the original error intact (code, etc)
+        except Exception as ex:
+            msg = 'Failed fetching image from URL %s: %s' % (image_url, ex)
+            self._logger.exception(msg)
+            raise error.FishyError(msg)
+        finally:
+            if custom_cert is not None:
+                custom_cert_file.close()
+
+        return local_file, local_file_path
+
+
+def _write_from_response(image_url, rsp, tmp_file):
+    with open(tmp_file.name, 'wb') as fl:
+        for chunk in rsp.iter_content(chunk_size=8192):
+            if chunk:
+                fl.write(chunk)
+
+    local_file = None
+
+    content_dsp = rsp.headers.get('content-disposition')
+    if content_dsp:
+        local_file = re.findall('filename="(.+)"', content_dsp)
+
+    if local_file:
+        local_file = local_file[0]
+
+    if not local_file:
+        parsed_url = urlparse.urlparse(image_url)
+        local_file = os.path.basename(parsed_url.path)
+
+    if not local_file:
+        local_file = 'image.iso'
+
+    return local_file
+
+
+class StaticDriver(BaseDriver):
+    """Redfish virtual media simulator for local image storage."""
 
     def insert_image(self, identity, device, image_url,
                      inserted=True, write_protected=True,
@@ -255,49 +337,8 @@ class StaticDriver(base.DriverBase):
 
         auth = (username, password) if (username and password) else None
 
-        if custom_cert is not None:
-            custom_cert_file = tempfile.NamedTemporaryFile(mode='wt')
-            custom_cert_file.write(custom_cert)
-            custom_cert_file.flush()
-            verify_media_cert = custom_cert_file.name
-
-        try:
-            with requests.get(image_url,
-                              stream=True,
-                              auth=auth,
-                              verify=verify_media_cert) as rsp:
-                if rsp.status_code >= 400:
-                    self._logger.error(
-                        'Failed fetching image from URL %s: '
-                        'got HTTP error %s:\n%s',
-                        image_url, rsp.status_code, rsp.text)
-                    target_code = 502 if rsp.status_code >= 500 else 400
-                    raise error.FishyError(
-                        "Cannot download virtual media: got error %s "
-                        "from the server" % rsp.status_code,
-                        code=target_code)
-
-                with tempfile.NamedTemporaryFile(
-                        mode='w+b', delete=False) as tmp_file:
-
-                    local_file = self._write_from_response(image_url,
-                                                           rsp, tmp_file)
-                    temp_dir = tempfile.mkdtemp(
-                        dir=os.path.dirname(tmp_file.name))
-                    local_file_path = os.path.join(temp_dir, local_file)
-
-                os.rename(tmp_file.name, local_file_path)
-        except error.FishyError as ex:
-            msg = 'Failed fetching image from URL %s: %s' % (image_url, ex)
-            self._logger.error(msg)
-            raise  # leave the original error intact (code, etc)
-        except Exception as ex:
-            msg = 'Failed fetching image from URL %s: %s' % (image_url, ex)
-            self._logger.exception(msg)
-            raise error.FishyError(msg)
-        finally:
-            if custom_cert is not None:
-                custom_cert_file.close()
+        local_file, local_file_path = self._get_image(
+            image_url, auth, verify_media_cert, custom_cert)
 
         self._logger.debug(
             'Fetched image %(url)s for %(identity)s' % {
@@ -344,3 +385,94 @@ class StaticDriver(base.DriverBase):
             except FileNotFoundError:
                 # Ignore error as we are trying to remove the file anyway
                 pass
+
+
+class OpenstackDriver(BaseDriver):
+    """Redfish virtual media simulator for openstack image storage."""
+
+    def __init__(self, config, logger, driver):
+        super().__init__(config, logger)
+        # Only support 'Cd', ignore SUSHY_EMULATOR_VMEDIA_DEVICES
+        self._device_types = {
+            'Cd': {
+                'Name': 'Virtual CD',
+                'MediaTypes': [
+                    'CD',
+                    'DVD'
+                ]
+            }
+        }
+        self._driver = driver
+
+    @property
+    def driver(self):
+        """Return human-friendly driver description
+
+        :returns: driver description as `str`
+        """
+        return self._driver.driver
+
+    def insert_image(self, identity, device, image_url,
+                     inserted=True, write_protected=True,
+                     username=None, password=None):
+        """Upload, remove or insert virtual media
+
+        :param identity: parent resource ID
+        :param device: device name
+        :param image_url: URL to ISO image to place into `device` or `None`
+            to eject currently present media
+        :param inserted: treat currently present media as inserted or not
+        :param write_protected: prevent write access the inserted media
+        :raises: `FishyError` if image can't be manipulated
+        """
+        device_info = self._get_device(identity, device)
+        verify_media_cert = device_info.get(
+            'Verify',
+            # NOTE(dtantsur): it's de facto standard for Redfish to default
+            # to no certificate validation.
+            self._config.get('SUSHY_EMULATOR_VMEDIA_VERIFY_SSL', False))
+        if verify_media_cert:
+            msg = ('The cloud driver %(driver)s does not support inserting an '
+                   'image with a custom download certificate' %
+                   {'driver': self.driver})
+            raise error.NotSupportedError(msg)
+
+        auth = (username, password) if (username and password) else None
+        if auth:
+            msg = ('The cloud driver %(driver)s does not support inserting an '
+                   'image with download credentials' % {'driver': self.driver})
+            raise error.NotSupportedError(msg)
+
+        local_file_path = None
+        if self._config.get(
+                'SUSHY_EMULATOR_OS_VMEDIA_IMAGE_FILE_UPLOAD', False):
+            self._logger.debug('Downloading image for %(identity)s'
+                               % {'identity': identity})
+            _, local_file_path = self._get_image(
+                image_url, auth, verify_media_cert, None)
+
+        image_id, image_name = self._driver.insert_image(
+            identity, image_url, local_file_path)
+
+        device_info['Image'] = image_url
+        device_info['ImageName'] = image_name
+        device_info['Inserted'] = inserted
+        device_info['WriteProtected'] = write_protected
+
+        self._devices.update({(identity, device): device_info})
+        return image_id
+
+    def eject_image(self, identity, device):
+        """Eject virtual media image
+
+        :param identity: parent resource ID
+        :param device: device name
+        :raises: `FishyError` if image can't be manipulated
+        """
+        device_info = self._get_device(identity, device)
+        self._driver.eject_image(identity)
+        device_info['Image'] = ''
+        device_info['ImageName'] = ''
+        device_info['Inserted'] = False
+
+        self._devices.update({(identity, device): device_info})

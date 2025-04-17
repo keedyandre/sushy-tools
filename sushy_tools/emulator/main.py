@@ -21,11 +21,12 @@ import ssl
 import sys
 
 import flask
-from ironic_lib import auth_basic
 from werkzeug import exceptions as wz_exc
 
 from sushy_tools.emulator import api_utils
+from sushy_tools.emulator import auth_basic
 from sushy_tools.emulator.controllers import certificate_service as certctl
+from sushy_tools.emulator.controllers import update_service as usctl
 from sushy_tools.emulator.controllers import virtual_media as vmctl
 from sushy_tools.emulator import memoize
 from sushy_tools.emulator.resources import chassis as chsdriver
@@ -34,6 +35,7 @@ from sushy_tools.emulator.resources import indicators as inddriver
 from sushy_tools.emulator.resources import managers as mgrdriver
 from sushy_tools.emulator.resources import storage as stgdriver
 from sushy_tools.emulator.resources.systems import fakedriver
+from sushy_tools.emulator.resources.systems import ironicdriver
 from sushy_tools.emulator.resources.systems import libvirtdriver
 from sushy_tools.emulator.resources.systems import novadriver
 from sushy_tools.emulator.resources import vmedia as vmddriver
@@ -89,7 +91,7 @@ class Application(flask.Flask):
 
     def configure(self, config_file=None, extra_config=None):
         if config_file:
-            self.config.from_pyfile(config_file)
+            self.config.from_pyfile(os.path.abspath(config_file))
         if extra_config:
             self.config.update(extra_config)
 
@@ -97,11 +99,24 @@ class Application(flask.Flask):
         if auth_file and not isinstance(self.wsgi_app, RedfishAuthMiddleware):
             self.wsgi_app = RedfishAuthMiddleware(self.wsgi_app, auth_file)
 
+        feature_set = self.config.get('SUSHY_EMULATOR_FEATURE_SET', 'full')
+        if feature_set not in ('full', 'vmedia', 'minimum'):
+            raise RuntimeError(f"Invalid feature set {self.feature_set}")
+
+    @property
+    def feature_set(self):
+        return self.config.get('SUSHY_EMULATOR_FEATURE_SET', 'full')
+
+    def render_template(self, template_name, /, **params):
+        params.setdefault('feature_set', self.feature_set)
+        return flask.render_template(template_name, **params)
+
     @property
     @memoize.memoize()
     def systems(self):
         fake = self.config.get('SUSHY_EMULATOR_FAKE_DRIVER')
         os_cloud = self.config.get('SUSHY_EMULATOR_OS_CLOUD')
+        ironic_cloud = self.config.get('SUSHY_EMULATOR_IRONIC_CLOUD')
 
         if fake:
             result = fakedriver.FakeDriver.initialize(
@@ -114,6 +129,14 @@ class Application(flask.Flask):
 
             result = novadriver.OpenStackDriver.initialize(
                 self.config, self.logger, os_cloud)()
+
+        elif ironic_cloud:
+            if not ironicdriver.is_loaded:
+                self.logger.error('Ironic driver not loaded')
+                sys.exit(1)
+
+            result = ironicdriver.IronicDriver.initialize(
+                self.config, self.logger, ironic_cloud)()
 
         else:
             if not libvirtdriver.is_loaded:
@@ -148,6 +171,10 @@ class Application(flask.Flask):
     @property
     @memoize.memoize()
     def vmedia(self):
+        os_cloud = self.config.get('SUSHY_EMULATOR_OS_CLOUD')
+        if os_cloud:
+            return vmddriver.OpenstackDriver(self.config, self.logger,
+                                             self.systems)
         return vmddriver.StaticDriver(self.config, self.logger)
 
     @property
@@ -169,6 +196,7 @@ class Application(flask.Flask):
 app = Application()
 app.register_blueprint(certctl.certificate_service)
 app.register_blueprint(vmctl.virtual_media)
+app.register_blueprint(usctl.update_service)
 
 
 @app.errorhandler(Exception)
@@ -193,15 +221,18 @@ def all_exception_handler(message):
 @app.route('/redfish/v1/')
 @api_utils.returns_json
 def root_resource():
-    return flask.render_template('root.json')
+    return app.render_template('root.json')
 
 
 @app.route('/redfish/v1/Chassis')
 @api_utils.returns_json
 def chassis_collection_resource():
+    if app.feature_set != "full":
+        raise error.FeatureNotAvailable("Chassis")
+
     app.logger.debug('Serving chassis list')
 
-    return flask.render_template(
+    return app.render_template(
         'chassis_collection.json',
         manager_count=len(app.chassis.chassis),
         chassis=app.chassis.chassis)
@@ -210,6 +241,9 @@ def chassis_collection_resource():
 @app.route('/redfish/v1/Chassis/<identity>', methods=['GET', 'PATCH'])
 @api_utils.returns_json
 def chassis_resource(identity):
+    if app.feature_set != "full":
+        raise error.FeatureNotAvailable("Chassis")
+
     chassis = app.chassis
 
     uuid = chassis.uuid(identity)
@@ -231,7 +265,7 @@ def chassis_resource(identity):
             storage = []
             drives = []
 
-        return flask.render_template(
+        return app.render_template(
             'chassis.json',
             identity=identity,
             name=chassis.name(identity),
@@ -262,6 +296,9 @@ def chassis_resource(identity):
 @app.route('/redfish/v1/Chassis/<identity>/Thermal', methods=['GET'])
 @api_utils.returns_json
 def thermal_resource(identity):
+    if app.feature_set != "full":
+        raise error.FeatureNotAvailable("Chassis")
+
     chassis = app.chassis
 
     uuid = chassis.uuid(identity)
@@ -276,7 +313,7 @@ def thermal_resource(identity):
     else:
         systems = []
 
-    return flask.render_template(
+    return app.render_template(
         'thermal.json',
         chassis=identity,
         systems=systems
@@ -286,9 +323,12 @@ def thermal_resource(identity):
 @app.route('/redfish/v1/Managers')
 @api_utils.returns_json
 def manager_collection_resource():
+    if app.feature_set == "minimum":
+        raise error.FeatureNotAvailable("Managers")
+
     app.logger.debug('Serving managers list')
 
-    return flask.render_template(
+    return app.render_template(
         'manager_collection.json',
         manager_count=len(app.managers.managers),
         managers=app.managers.managers)
@@ -309,6 +349,9 @@ def jsonify(obj_type, obj_version, obj):
 @app.route('/redfish/v1/Managers/<identity>', methods=['GET'])
 @api_utils.returns_json
 def manager_resource(identity):
+    if app.feature_set == "minimum":
+        raise error.FeatureNotAvailable("Managers")
+
     app.logger.debug('Serving resources for manager "%s"', identity)
 
     manager = app.managers.get_manager(identity)
@@ -316,24 +359,13 @@ def manager_resource(identity):
     chassis = app.managers.get_managed_chassis(manager)
 
     uuid = manager['UUID']
-    return jsonify('Manager', 'v1_3_1', {
+    result = {
         "Id": manager['Id'],
         "Name": manager.get('Name'),
         "UUID": uuid,
-        "ServiceEntryPointUUID": manager.get('ServiceEntryPointUUID'),
         "ManagerType": "BMC",
-        "Description": "Contoso BMC",
-        "Model": "Joo Janta 200",
-        "DateTime": datetime.now().strftime('%Y-%M-%dT%H:%M:%S+00:00'),
-        "DateTimeLocalOffset": "+00:00",
-        "Status": {
-            "State": "Enabled",
-            "Health": "OK"
-        },
-        "PowerState": "On",
-        "FirmwareVersion": "1.00",
         "VirtualMedia": {
-            "@odata.id": "/redfish/v1/Managers/%s/VirtualMedia" % uuid
+            "@odata.id": "/redfish/v1/Systems/%s/VirtualMedia" % systems[0],
         },
         "Links": {
             "ManagerForServers": [
@@ -346,11 +378,27 @@ def manager_resource(identity):
                 {
                     "@odata.id": "/redfish/v1/Chassis/%s" % ch
                 }
-                for ch in chassis
+                for ch in chassis if app.feature_set == "full"
             ]
         },
-        "@odata.id": "/redfish/v1/Managers/%s" % uuid
-    })
+        "@odata.id": "/redfish/v1/Managers/%s" % uuid,
+    }
+    if app.feature_set == "full":
+        result.update({
+            "ServiceEntryPointUUID": manager.get('ServiceEntryPointUUID'),
+            "Description": "Contoso BMC",
+            "Model": "Joo Janta 200",
+            "DateTime": datetime.now().strftime('%Y-%M-%dT%H:%M:%S+00:00'),
+            "DateTimeLocalOffset": "+00:00",
+            "Status": {
+                "State": "Enabled",
+                "Health": "OK"
+            },
+            "PowerState": "On",
+            "FirmwareVersion": "1.00",
+        })
+
+    return jsonify('Manager', 'v1_3_1', result)
 
 
 @app.route('/redfish/v1/Systems')
@@ -361,7 +409,7 @@ def system_collection_resource():
 
     app.logger.debug('Serving systems list')
 
-    return flask.render_template(
+    return app.render_template(
         'system_collection.json', system_count=len(systems), systems=systems)
 
 
@@ -369,6 +417,16 @@ def system_collection_resource():
 @api_utils.ensure_instance_access
 @api_utils.returns_json
 def system_resource(identity):
+    uuid = app.systems.uuid(identity)
+    try:
+        versions = app.systems.get_versions(identity)
+    except error.NotSupportedError:
+        app.logger.debug('Fetching BIOS version information not supported '
+                         'for system "%s"', identity)
+        versions = {}
+
+    bios_version = versions.get('BiosVersion')
+
     if flask.request.method == 'GET':
 
         app.logger.debug('Serving resources for system "%s"', identity)
@@ -379,20 +437,23 @@ def system_resource(identity):
             except error.NotSupportedError:
                 return None
 
-        return flask.render_template(
+        return app.render_template(
             'system.json',
             identity=identity,
             name=app.systems.name(identity),
             uuid=app.systems.uuid(identity),
             power_state=app.systems.get_power_state(identity),
             total_memory_gb=try_get(app.systems.get_total_memory),
+            bios_version=bios_version,
             total_cpus=try_get(app.systems.get_total_cpus),
             boot_source_target=app.systems.get_boot_device(identity),
             boot_source_mode=try_get(app.systems.get_boot_mode),
+            uefi_mode=(try_get(app.systems.get_boot_mode) == 'UEFI'),
             managers=app.managers.get_managers_for_system(identity),
             chassis=app.chassis.chassis[:1],
             indicator_led=app.indicators.get_indicator_state(
-                app.systems.uuid(identity))
+                app.systems.uuid(identity)),
+            http_boot_uri=try_get(app.systems.get_http_boot_uri)
         )
 
     elif flask.request.method == 'PATCH':
@@ -401,9 +462,54 @@ def system_resource(identity):
         if not boot and not indicator_led_state:
             return ('PATCH only works for Boot and '
                     'IndicatorLED elements'), 400
+        if indicator_led_state and app.feature_set != "full":
+            raise error.FeatureNotAvailable("IndicatorLED", code=400)
 
         if boot:
             target = boot.get('BootSourceOverrideTarget')
+            mode = boot.get('BootSourceOverrideMode')
+            http_uri = boot.get('HttpBootUri')
+
+            if http_uri and target == 'UefiHttp':
+
+                try:
+                    # Download the image
+                    image_path = app.vmedia.insert_image(
+                        identity, 'Cd', http_uri)
+                except Exception as e:
+                    app.logger.error('Unable to insert image for HttpBootUri '
+                                     'request processing. Error: %s', e)
+                    return 'Failed to download and attach HttpBootUri.', 400
+                try:
+                    # Mount it as an ISO
+                    app.systems.set_boot_image(
+                        uuid,
+                        'Cd', boot_image=image_path,
+                        write_protected=True)
+                    # Set it for our emulator's API surface to return it
+                    # if queried.
+                except Exception as e:
+                    app.logger.error('Unable to attach HttpBootUri for boot '
+                                     'operation. Error: %s', e)
+                    return (('Failed to set the supplied media as the next '
+                             'bootdevice.'), 400)
+                try:
+                    app.systems.set_http_boot_uri(http_uri)
+                except Exception as e:
+                    app.logger.error('Unable to record HttpBootUri for boot '
+                                     'operation. Error: %s', e)
+                    return 'Failed to save HttpBootUri field value.', 400
+                # Explicitly set to CD as in this case we will boot a an iso
+                # image provided, not precisely the same, but BMC facilitated
+                # HTTPBoot is a little different and the overall functionality
+                # test is more important.
+                target = 'Cd'
+
+            if target == 'UefiHttp' and not http_uri:
+                # Reset to Pxe, in our case, since we can't force override
+                # the network boot to a specific URL. This is sort of a hack
+                # but testing functionality overall is a bit more important.
+                target = 'Pxe'
 
             if target:
                 # NOTE(lucasagomes): In libvirt we always set the boot
@@ -415,21 +521,20 @@ def system_resource(identity):
                 app.logger.info('Set boot device to "%s" for system "%s"',
                                 target, identity)
 
-            mode = boot.get('BootSourceOverrideMode')
-
             if mode:
                 app.systems.set_boot_mode(identity, mode)
 
                 app.logger.info('Set boot mode to "%s" for system "%s"',
                                 mode, identity)
 
-            if not target and not mode:
+            if not target and not mode and not http_uri:
                 return ('Missing the BootSourceOverrideTarget and/or '
-                        'BootSourceOverrideMode element', 400)
+                        'BootSourceOverrideMode and/or HttpBootUri '
+                        'element', 400)
 
         if indicator_led_state:
             app.indicators.set_indicator_state(
-                app.systems.uuid(identity), indicator_led_state)
+                uuid, indicator_led_state)
 
             app.logger.info('Set indicator LED to "%s" for system "%s"',
                             indicator_led_state, identity)
@@ -442,9 +547,12 @@ def system_resource(identity):
 @api_utils.ensure_instance_access
 @api_utils.returns_json
 def ethernet_interfaces_collection(identity):
+    if app.feature_set == "minimum":
+        raise error.FeatureNotAvailable("EthernetInterfaces")
+
     nics = app.systems.get_nics(identity)
 
-    return flask.render_template(
+    return app.render_template(
         'ethernet_interfaces_collection.json', identity=identity,
         nics=nics)
 
@@ -454,11 +562,14 @@ def ethernet_interfaces_collection(identity):
 @api_utils.ensure_instance_access
 @api_utils.returns_json
 def ethernet_interface(identity, nic_id):
+    if app.feature_set == "minimum":
+        raise error.FeatureNotAvailable("EthernetInterfaces")
+
     nics = app.systems.get_nics(identity)
 
     for nic in nics:
         if nic['id'] == nic_id:
-            return flask.render_template(
+            return app.render_template(
                 'ethernet_interface.json', identity=identity, nic=nic)
 
     raise error.NotFound()
@@ -469,9 +580,12 @@ def ethernet_interface(identity, nic_id):
 @api_utils.ensure_instance_access
 @api_utils.returns_json
 def processors_collection(identity):
+    if app.feature_set != "full":
+        raise error.FeatureNotAvailable("Processors")
+
     processors = app.systems.get_processors(identity)
 
-    return flask.render_template(
+    return app.render_template(
         'processors_collection.json', identity=identity,
         processors=processors)
 
@@ -481,11 +595,14 @@ def processors_collection(identity):
 @api_utils.ensure_instance_access
 @api_utils.returns_json
 def processor(identity, processor_id):
+    if app.feature_set != "full":
+        raise error.FeatureNotAvailable("Processors")
+
     processors = app.systems.get_processors(identity)
 
     for proc in processors:
         if proc['id'] == processor_id:
-            return flask.render_template(
+            return app.render_template(
                 'processor.json', identity=identity, processor=proc)
 
     raise error.NotFound()
@@ -497,6 +614,12 @@ def processor(identity, processor_id):
 @api_utils.returns_json
 def system_reset_action(identity):
     reset_type = flask.request.json.get('ResetType')
+    if app.config.get('SUSHY_EMULATOR_DISABLE_POWER_OFF') is True and \
+            reset_type in ('ForceOff', 'GracefulShutdown'):
+        raise error.BadRequest('Can not request power off transition. It is '
+                               'disabled via the '
+                               'SUSHY_EMULATOR_DISABLE_POWER_OFF configuration'
+                               'option.')
 
     app.systems.set_power_state(identity, reset_type)
 
@@ -510,11 +633,14 @@ def system_reset_action(identity):
 @api_utils.ensure_instance_access
 @api_utils.returns_json
 def bios(identity):
+    if app.feature_set != "full":
+        raise error.FeatureNotAvailable("BIOS")
+
     bios = app.systems.get_bios(identity)
 
     app.logger.debug('Serving BIOS for system "%s"', identity)
 
-    return flask.render_template(
+    return app.render_template(
         'bios.json',
         identity=identity,
         bios_current_attributes=json.dumps(bios, sort_keys=True, indent=6))
@@ -525,13 +651,15 @@ def bios(identity):
 @api_utils.ensure_instance_access
 @api_utils.returns_json
 def bios_settings(identity):
+    if app.feature_set != "full":
+        raise error.FeatureNotAvailable("BIOS")
 
     if flask.request.method == 'GET':
         bios = app.systems.get_bios(identity)
 
         app.logger.debug('Serving BIOS Settings for system "%s"', identity)
 
-        return flask.render_template(
+        return app.render_template(
             'bios_settings.json',
             identity=identity,
             bios_pending_attributes=json.dumps(bios, sort_keys=True, indent=6))
@@ -551,6 +679,9 @@ def bios_settings(identity):
 @api_utils.ensure_instance_access
 @api_utils.returns_json
 def system_reset_bios(identity):
+    if app.feature_set != "full":
+        raise error.FeatureNotAvailable("BIOS")
+
     app.systems.reset_bios(identity)
 
     app.logger.info('BIOS for system "%s" reset', identity)
@@ -563,13 +694,15 @@ def system_reset_bios(identity):
 @api_utils.ensure_instance_access
 @api_utils.returns_json
 def secure_boot(identity):
+    if app.feature_set != "full":
+        raise error.FeatureNotAvailable("SecureBoot")
 
     if flask.request.method == 'GET':
         secure = app.systems.get_secure_boot(identity)
 
         app.logger.debug('Serving secure boot for system "%s"', identity)
 
-        return flask.render_template(
+        return app.render_template(
             'secure_boot.json',
             identity=identity,
             secure_boot_enable=secure,
@@ -590,10 +723,13 @@ def secure_boot(identity):
 @api_utils.ensure_instance_access
 @api_utils.returns_json
 def simple_storage_collection(identity):
+    if app.feature_set != "full":
+        raise error.FeatureNotAvailable("SimpleStorage")
+
     simple_storage_controllers = (
         app.systems.get_simple_storage_collection(identity))
 
-    return flask.render_template(
+    return app.render_template(
         'simple_storage_collection.json', identity=identity,
         simple_storage_controllers=simple_storage_controllers)
 
@@ -603,6 +739,9 @@ def simple_storage_collection(identity):
 @api_utils.ensure_instance_access
 @api_utils.returns_json
 def simple_storage(identity, simple_storage_id):
+    if app.feature_set != "full":
+        raise error.FeatureNotAvailable("SimpleStorage")
+
     simple_storage_controllers = (
         app.systems.get_simple_storage_collection(identity))
     try:
@@ -610,8 +749,8 @@ def simple_storage(identity, simple_storage_id):
     except KeyError:
         app.logger.debug('"%s" Simple Storage resource was not found')
         raise error.NotFound()
-    return flask.render_template('simple_storage.json', identity=identity,
-                                 simple_storage=storage_controller)
+    return app.render_template('simple_storage.json', identity=identity,
+                               simple_storage=storage_controller)
 
 
 @app.route('/redfish/v1/Systems/<identity>/Storage',
@@ -619,11 +758,14 @@ def simple_storage(identity, simple_storage_id):
 @api_utils.ensure_instance_access
 @api_utils.returns_json
 def storage_collection(identity):
+    if app.feature_set != "full":
+        raise error.FeatureNotAvailable("Storage")
+
     uuid = app.systems.uuid(identity)
 
     storage_col = app.storage.get_storage_col(uuid)
 
-    return flask.render_template(
+    return app.render_template(
         'storage_collection.json', identity=identity,
         storage_col=storage_col)
 
@@ -633,12 +775,15 @@ def storage_collection(identity):
 @api_utils.ensure_instance_access
 @api_utils.returns_json
 def storage(identity, storage_id):
+    if app.feature_set != "full":
+        raise error.FeatureNotAvailable("Storage")
+
     uuid = app.systems.uuid(identity)
     storage_col = app.storage.get_storage_col(uuid)
 
     for stg in storage_col:
         if stg['Id'] == storage_id:
-            return flask.render_template(
+            return app.render_template(
                 'storage.json', identity=identity, storage=stg)
 
     raise error.NotFound()
@@ -649,12 +794,15 @@ def storage(identity, storage_id):
 @api_utils.ensure_instance_access
 @api_utils.returns_json
 def drive_resource(identity, stg_id, drv_id):
+    if app.feature_set != "full":
+        raise error.FeatureNotAvailable("Storage")
+
     uuid = app.systems.uuid(identity)
     drives = app.drives.get_drives(uuid, stg_id)
 
     for drv in drives:
         if drv['Id'] == drv_id:
-            return flask.render_template(
+            return app.render_template(
                 'drive.json', identity=identity, storage_id=stg_id, drive=drv)
 
     raise error.NotFound()
@@ -665,6 +813,9 @@ def drive_resource(identity, stg_id, drv_id):
 @api_utils.ensure_instance_access
 @api_utils.returns_json
 def volumes_collection(identity, storage_id):
+    if app.feature_set != "full":
+        raise error.FeatureNotAvailable("Storage")
+
     uuid = app.systems.uuid(identity)
 
     if flask.request.method == 'GET':
@@ -679,7 +830,7 @@ def volumes_collection(identity, storage_id):
             else:
                 vol_ids.append(vol_id)
 
-        return flask.render_template(
+        return app.render_template(
             'volume_collection.json', identity=identity,
             storage_id=storage_id, volume_col=vol_ids)
 
@@ -707,6 +858,9 @@ def volumes_collection(identity, storage_id):
 @api_utils.ensure_instance_access
 @api_utils.returns_json
 def volume(identity, stg_id, vol_id):
+    if app.feature_set != "full":
+        raise error.FeatureNotAvailable("Storage")
+
     uuid = app.systems.uuid(identity)
     vol_col = app.volumes.get_volumes_col(uuid, stg_id)
 
@@ -716,7 +870,7 @@ def volume(identity, stg_id, vol_id):
             if not vol_id:
                 app.volumes.delete_volume(uuid, stg_id, vol)
             else:
-                return flask.render_template(
+                return app.render_template(
                     'volume.json', identity=identity, storage_id=stg_id,
                     volume=vol)
 
@@ -726,44 +880,75 @@ def volume(identity, stg_id, vol_id):
 @app.route('/redfish/v1/Registries')
 @api_utils.returns_json
 def registry_file_collection():
+    if app.feature_set != "full":
+        raise error.FeatureNotAvailable("Registries")
+
     app.logger.debug('Serving registry file collection')
 
-    return flask.render_template(
+    return app.render_template(
         'registry_file_collection.json')
 
 
 @app.route('/redfish/v1/Registries/BiosAttributeRegistry.v1_0_0')
 @api_utils.returns_json
 def bios_attribute_registry_file():
+    if app.feature_set != "full":
+        raise error.FeatureNotAvailable("Registries")
+
     app.logger.debug('Serving BIOS attribute registry file')
 
-    return flask.render_template(
+    return app.render_template(
         'bios_attribute_registry_file.json')
 
 
 @app.route('/redfish/v1/Registries/Messages')
 @api_utils.returns_json
 def message_registry_file():
+    if app.feature_set != "full":
+        raise error.FeatureNotAvailable("Registries")
+
     app.logger.debug('Serving message registry file')
 
-    return flask.render_template(
+    return app.render_template(
         'message_registry_file.json')
 
 
 @app.route('/redfish/v1/Systems/Bios/BiosRegistry')
 @api_utils.returns_json
 def bios_registry():
+    if app.feature_set != "full":
+        raise error.FeatureNotAvailable("Registries")
+
     app.logger.debug('Serving BIOS registry')
 
-    return flask.render_template('bios_registry.json')
+    return app.render_template('bios_registry.json')
 
 
 @app.route('/redfish/v1/Registries/Messages/Registry')
 @api_utils.returns_json
 def message_registry():
+    if app.feature_set != "full":
+        raise error.FeatureNotAvailable("Registries")
+
     app.logger.debug('Serving message registry')
 
-    return flask.render_template('message_registry.json')
+    return app.render_template('message_registry.json')
+
+
+@app.route('/redfish/v1/TaskService',
+           methods=['GET'])
+@api_utils.ensure_instance_access
+@api_utils.returns_json
+def simple_task_service():
+    return app.render_template('task_service.json')
+
+
+@app.route('/redfish/v1/TaskService/Tasks/42',
+           methods=['GET'])
+@api_utils.ensure_instance_access
+@api_utils.returns_json
+def simple_task():
+    return app.render_template('task.json')
 
 
 def parse_args():
@@ -793,6 +978,10 @@ def parse_args():
                         type=str,
                         help='SSL key to use for HTTPS. Can also be set'
                         'via config variable SUSHY_EMULATOR_SSL_KEY.')
+    parser.add_argument('--feature-set',
+                        type=str, choices=['full', 'vmedia', 'minimum'],
+                        help='Feature set to provide. Can also be set'
+                        'via config variable SUSHY_EMULATOR_FEATURE_SET.')
     backend_group = parser.add_mutually_exclusive_group()
     backend_group.add_argument('--os-cloud',
                                type=str,
@@ -808,8 +997,13 @@ def parse_args():
                                     'Default is qemu:///system')
     backend_group.add_argument('--fake', action='store_true',
                                help='Use the fake driver. Can also be set '
-                                    'via environmnet variable '
+                                    'via environment variable '
                                     'SUSHY_EMULATOR_FAKE_DRIVER.')
+    backend_group.add_argument('--ironic-cloud',
+                               type=str,
+                               help='Ironic cloud name. Can also be set via '
+                                    'via config variable '
+                                    'SUSHY_EMULATOR_IRONIC_CLOUD.')
 
     return parser.parse_args()
 
@@ -827,6 +1021,9 @@ def main():
 
     if args.libvirt_uri:
         app.config['SUSHY_EMULATOR_LIBVIRT_URI'] = args.libvirt_uri
+
+    if args.ironic_cloud:
+        app.config['SUSHY_EMULATOR_IRONIC_CLOUD'] = args.ironic_cloud
 
     if args.fake:
         app.config['SUSHY_EMULATOR_FAKE_DRIVER'] = True
@@ -849,6 +1046,9 @@ def main():
 
     if args.ssl_key:
         app.config['SUSHY_EMULATOR_SSL_KEY'] = args.ssl_key
+
+    if args.feature_set:
+        app.config['SUSHY_EMULATOR_FEATURE_SET'] = args.feature_set
 
     ssl_context = None
     ssl_certificate = app.config.get('SUSHY_EMULATOR_SSL_CERT')

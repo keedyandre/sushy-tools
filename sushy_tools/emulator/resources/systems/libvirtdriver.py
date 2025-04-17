@@ -38,6 +38,11 @@ BiosProcessResult = namedtuple('BiosProcessResult',
                                 'attributes_written',
                                 'bios_attributes'])
 
+FirmwareProcessResult = namedtuple('FirmwareProcessResult',
+                                   ['tree',
+                                    'attributes_written',
+                                    'firmware_versions'])
+
 
 class libvirt_open(object):
 
@@ -92,6 +97,14 @@ class LibvirtDriver(AbstractSystemsDriver):
 
     LIBVIRT_URI = 'qemu:///system'
 
+    BOOT_MODE_AUTO_FW_MAP = {
+        'UEFI': 'efi',
+        'Legacy': 'bios'
+    }
+
+    BOOT_MODE_AUTO_FW_MAP_REV = {v: k for k, v
+                                 in BOOT_MODE_AUTO_FW_MAP.items()}
+
     BOOT_MODE_MAP = {
         'Legacy': 'rom',
         'UEFI': 'pflash'
@@ -126,6 +139,8 @@ class LibvirtDriver(AbstractSystemsDriver):
         constants.DEVICE_TYPE_FLOPPY: ('fda', 'fdc'),
         constants.DEVICE_TYPE_CD: ('hdc', 'ide'),
     }
+
+    DEFAULT_FIRMWARE_VERSIONS = {"BiosVersion": "1.0.0"}
 
     DEFAULT_BIOS_ATTRIBUTES = {"BootMode": "Uefi",
                                "EmbeddedSata": "Raid",
@@ -172,6 +187,9 @@ class LibvirtDriver(AbstractSystemsDriver):
             cls.SECURE_BOOT_DISABLED_NVRAM)
         cls.SUSHY_EMULATOR_IGNORE_BOOT_DEVICE = \
             cls._config.get('SUSHY_EMULATOR_IGNORE_BOOT_DEVICE', False)
+        cls.STORAGE_POOL = cls._config.get(
+            'SUSHY_EMULATOR_STORAGE_POOL', cls.STORAGE_POOL)
+        cls._http_boot_uri = None
         return cls
 
     @memoize.memoize()
@@ -290,7 +308,8 @@ class LibvirtDriver(AbstractSystemsDriver):
                     domain.reboot()
             elif state == 'ForceRestart':
                 if domain.isActive():
-                    domain.reset()
+                    domain.destroy()
+                    domain.create()
             elif state == 'Nmi':
                 if domain.isActive():
                     domain.injectNMI()
@@ -444,7 +463,7 @@ class LibvirtDriver(AbstractSystemsDriver):
 
         # Remove per-disk boot configuration
         # We should save at least hdd boot entries instead of just removing
-        # everything. In some scenarious PXE after provisioning stops replying
+        # everything. In some scenarios PXE after provisioning stops replying
         # and if there is no other boot device, then vm will fail to boot
         # cdrom and floppy are ignored.
 
@@ -502,6 +521,18 @@ class LibvirtDriver(AbstractSystemsDriver):
 
         self._defineDomain(tree)
 
+    def _is_firmware_autoselection(self, tree):
+        """Get libvirt firmware autoselection mode
+
+        :param tree: libvirt domain XML tree
+
+        :returns: True if firmware autoselection is enabled
+        """
+
+        os_element = tree.find('.//os')
+
+        return True if os_element.get('firmware') else False
+
     def get_boot_mode(self, identity):
         """Get computer system boot mode.
 
@@ -515,8 +546,15 @@ class LibvirtDriver(AbstractSystemsDriver):
         # XML schema: https://libvirt.org/formatdomain.html#elementsOSBIOS
         tree = ET.fromstring(domain.XMLDesc(libvirt.VIR_DOMAIN_XML_INACTIVE))
 
-        loader_element = tree.find('.//loader')
+        if self._is_firmware_autoselection(tree):
+            os_element = tree.find('.//os')
+            boot_mode = (
+                self.BOOT_MODE_AUTO_FW_MAP_REV.get(os_element.get('firmware'))
+            )
 
+            return boot_mode
+
+        loader_element = tree.find('.//loader')
         if loader_element is not None:
             boot_mode = (
                 self.BOOT_MODE_MAP_REV.get(loader_element.get('type'))
@@ -557,9 +595,6 @@ class LibvirtDriver(AbstractSystemsDriver):
     def _build_os_element(self, identity, tree, boot_mode, secure=None):
         """Set the boot mode and secure boot on the os element
 
-        This also converts from the previous manual layout to the automatic
-        approach.
-
         :raises: `error.FishyError` if boot mode can't be set
         """
         try:
@@ -580,6 +615,54 @@ class LibvirtDriver(AbstractSystemsDriver):
 
         os_element = os_elements[0]
 
+        if self._is_firmware_autoselection(tree):
+            self._build_os_element_fw_autoselection(boot_mode, secure,
+                                                    os_element)
+        else:
+            self._build_os_element_fw_manualselection(boot_mode, secure,
+                                                      os_element, loader_type)
+
+    def _build_os_element_fw_autoselection(self, boot_mode, secure,
+                                           os_element):
+        """Set the boot mode and secure boot (auto-selection)
+
+        :raises: `error.FishyError` if boot mode can't be set
+        """
+        os_element.set('firmware', self.BOOT_MODE_AUTO_FW_MAP[boot_mode])
+
+        # Delete the secure-boot feature element
+        try:
+            firmware_element = os_element.findall('firmware').pop()
+            for e in firmware_element.findall('.feature'
+                                              '[@name="secure-boot"]'):
+                firmware_element.remove(e)
+        except IndexError:
+            firmware_element = None
+
+        if boot_mode != 'UEFI':
+            return
+
+        if firmware_element is None:
+            firmware_element = ET.SubElement(os_element, 'firmware')
+
+        if secure:
+            secure_boot_element = ET.SubElement(firmware_element, 'feature')
+            secure_boot_element.set('name', 'secure-boot')
+            secure_boot_element.set('enabled', 'yes')
+        else:
+            secure_boot_element = ET.SubElement(firmware_element, 'feature')
+            secure_boot_element.set('name', 'secure-boot')
+            secure_boot_element.set('enabled', 'no')
+
+    def _build_os_element_fw_manualselection(self, boot_mode, secure,
+                                             os_element, loader_type):
+        """Set the boot mode and secure boot (manual-selection)
+
+        This also converts from the previous manual layout to the automatic
+        approach.
+
+        :raises: `error.FishyError` if boot mode can't be set
+        """
         type_element = os_element.find('type')
         if type_element is None:
             os_arch = None
@@ -596,6 +679,9 @@ class LibvirtDriver(AbstractSystemsDriver):
                 'Assuming default boot loader for the domain.',
                 boot_mode, os_arch)
             loader_path = None
+
+        nvram_element = os_element.find('nvram')
+        nvram_path = nvram_element.text if nvram_element is not None else None
 
         # delete loader and nvram elements to rebuild from stratch
         for element in os_element.findall('loader'):
@@ -616,16 +702,24 @@ class LibvirtDriver(AbstractSystemsDriver):
                 loader_element.set('secure', 'yes')
                 nvram_element.set('template', self.SECURE_BOOT_ENABLED_NVRAM)
             else:
-                nvram_suffix = '.fd'
+                nvram_suffix = '.nosecboot.fd'
                 loader_element.set('secure', 'no')
                 nvram_element.set('template', self.SECURE_BOOT_DISABLED_NVRAM)
 
             # force a different nvram path for secure vs not. This will ensure
             # it gets regenerated from the template when secure boot mode
             # changes
-            nvram_path = "/var/lib/libvirt/nvram-%s%s" % (identity,
-                                                          nvram_suffix)
-            nvram_element.text = nvram_path
+            if nvram_path:
+                nvram_file = os.path.basename(nvram_path)
+                # replace suffix
+                for suffix in ['.secboot.fd', '.nosecboot.fd', '.fd']:
+                    # str.removesuffix() for Python <3.9
+                    if nvram_file.endswith(suffix):
+                        nvram_file = nvram_file[:-len(suffix)]
+
+                nvram_file += nvram_suffix
+                nvram_element.text = os.path.join(os.path.dirname(nvram_path),
+                                                  nvram_file)
 
     def get_secure_boot(self, identity):
         """Get computer system secure boot state for UEFI boot mode.
@@ -644,6 +738,43 @@ class LibvirtDriver(AbstractSystemsDriver):
         # https://libvirt.org/formatdomain.html#operating-system-booting
         tree = ET.fromstring(domain.XMLDesc(libvirt.VIR_DOMAIN_XML_INACTIVE))
 
+        if self._is_firmware_autoselection(tree):
+            return self._get_secureboot_fw_auto_selection(identity, tree)
+        else:
+            return self._get_secureboot_fw_manual_selection(identity, tree)
+
+    def _get_secureboot_fw_auto_selection(self, identity, tree):
+        os_element = tree.find('os')
+
+        firmware_element = os_element.findall('firmware')
+
+        if len(firmware_element) == 0:
+            msg = ('Can\'t get secure boot state because "firmware" element '
+                   'is not present in domain "%(identity)s" configuration'
+                   % {'identity': identity})
+            raise error.FishyError(msg)
+
+        if len(firmware_element) > 1:
+            msg = ('Can\'t get secure boot state because "firmware" element '
+                   'must be present exactly once in domain "%(identity)s" '
+                   'configuration' % {'identity': identity})
+            raise error.FishyError(msg)
+
+        feature_secure_boot = os_element.findall('./firmware/feature'
+                                                 '[@name="secure-boot"]')
+        if len(feature_secure_boot) > 1:
+            msg = ('Can\'t get secure boot state because the "firmware" '
+                   'element contains multiple "feature" elements with the '
+                   '"secure-boot" name attribute. "secure-boot" feature '
+                   'should be present exactly once in domain %(identity)s" '
+                   'configuration' % {'identity': identity})
+            raise error.FishyError(msg)
+
+        enabled = feature_secure_boot[0].get('enabled', "no")
+
+        return True if enabled == "yes" else False
+
+    def _get_secureboot_fw_manual_selection(self, identity, tree):
         os_element = tree.find('os')
 
         nvram = os_element.findall('nvram')
@@ -773,11 +904,14 @@ class LibvirtDriver(AbstractSystemsDriver):
         bios = metadata.find('sushy:bios', ns)
 
         attributes_written = False
-        if bios is not None and update_existing_attributes:
-            metadata.remove(bios)
-            bios = None
         if bios is None:
             bios = ET.SubElement(metadata, '{%s}bios' % (namespace))
+
+        attributes = bios.find('sushy:attributes', ns)
+        if attributes is not None and update_existing_attributes:
+            bios.remove(attributes)
+            attributes = None
+        if attributes is None:
             attributes = ET.SubElement(bios, '{%s}attributes' % (namespace))
             for key, value in sorted(bios_attributes.items()):
                 if not isinstance(value, str):
@@ -792,6 +926,84 @@ class LibvirtDriver(AbstractSystemsDriver):
                            for atr in tree.find('.//sushy:attributes', ns)}
 
         return BiosProcessResult(tree, attributes_written, bios_attributes)
+
+    def _process_versions_attributes(
+            self,
+            domain_xml,
+            firmware_versions=DEFAULT_FIRMWARE_VERSIONS,
+            update_existing_attributes=False):
+        """Process Libvirt domain XML for firmware version attributes
+
+        This method supports adding default firmware version information,
+        retrieving existing version attributes and
+        updating existing version attributes.
+
+        This method is introduced to make XML testable otherwise have to
+        compare XML strings to test if XML saved to libvirt is as expected.
+
+        Sample of custom XML (attributes section retained for context
+        although this code doesn't manage attributes, only versions:
+        <domain type="kvm">
+        [...]
+          <metadata xmlns:sushy="http://openstack.org/xmlns/libvirt/sushy">
+            <sushy:bios>
+              <sushy:attributes>
+                <sushy:attribute name="ProcTurboMode" value="Enabled"/>
+                <sushy:attribute name="BootMode" value="Uefi"/>
+                <sushy:attribute name="NicBoot1" value="NetworkBoot"/>
+                <sushy:attribute name="EmbeddedSata" value="Raid"/>
+              </sushy:attributes>
+              <sushy:versions>
+                <sushy:version name="BiosVersion" value="1.1.0"/>
+              </sushy:versions>
+            </sushy:bios>
+          </metadata>
+        [...]
+
+        :param domain_xml: Libvirt domain XML to process
+        :param firmware_versions: firmware version information for updates or
+            default values if not specified
+        :param update_existing_attributes: Update existing firmware version
+        attributes
+
+        :returns: namedtuple of tree: processed XML element tree,
+            attributes_written: if changes were made to XML,
+            versions: dict of firmware versions
+        """
+        namespace = 'http://openstack.org/xmlns/libvirt/sushy'
+        ET.register_namespace('sushy', namespace)
+        ns = {'sushy': namespace}
+
+        tree = ET.fromstring(domain_xml)
+        metadata = tree.find('metadata')
+
+        if metadata is None:
+            metadata = ET.SubElement(tree, 'metadata')
+        bios = metadata.find('sushy:bios', ns)
+
+        attributes_written = False
+        if bios is None:
+            bios = ET.SubElement(metadata, '{%s}bios' % (namespace))
+        versions = bios.find('sushy:versions', ns)
+        if versions is not None and update_existing_attributes:
+            bios.remove(versions)
+            versions = None
+        if versions is None:
+            versions = ET.SubElement(bios, '{%s}versions' % (namespace))
+            for key, value in sorted(firmware_versions.items()):
+                if not isinstance(value, str):
+                    value = str(value)
+                ET.SubElement(versions,
+                              '{%s}version' % (namespace),
+                              name=key,
+                              value=value)
+            attributes_written = True
+
+        firmware_versions = {ver.attrib['name']: ver.attrib['value']
+                             for ver in tree.find('.//sushy:versions', ns)}
+
+        return FirmwareProcessResult(tree, attributes_written,
+                                     firmware_versions)
 
     def _process_bios(self, identity,
                       bios_attributes=DEFAULT_BIOS_ATTRIBUTES,
@@ -832,6 +1044,44 @@ class LibvirtDriver(AbstractSystemsDriver):
 
         return result.bios_attributes
 
+    def _process_versions(self, identity,
+                          firmware_versions=DEFAULT_FIRMWARE_VERSIONS,
+                          update_existing_attributes=False):
+        """Process Libvirt domain XML for firmware versions
+
+        Process Libvirt domain XML for firmware versions and update it if
+        necessary
+
+        :param identity: libvirt domain name or ID
+        :param firmware_versions: Full list of firmware versions to use if
+            they are missing or update necessary
+        :param update_existing_attributes: Update existing firmware versions
+
+        :returns: New or existing dict of firmware versions
+
+        :raises: `error.FishyError` if firmware versions cannot be saved
+        """
+
+        domain = self._get_domain(identity)
+
+        result = self._process_versions_attributes(
+            domain.XMLDesc(libvirt.VIR_DOMAIN_XML_INACTIVE),
+            firmware_versions,
+            update_existing_attributes)
+
+        if result.attributes_written:
+
+            try:
+                with libvirt_open(self._uri) as conn:
+                    conn.defineXML(ET.tostring(result.tree).decode('utf-8'))
+
+            except libvirt.libvirtError as e:
+                msg = ('Error updating firmware versions'
+                       ' at libvirt URI "%(uri)s": '
+                       '%(error)s' % {'uri': self._uri, 'error': e})
+                raise error.FishyError(msg)
+        return result.firmware_versions
+
     def get_bios(self, identity):
         """Get BIOS section
 
@@ -841,6 +1091,17 @@ class LibvirtDriver(AbstractSystemsDriver):
         :returns: dict of BIOS attributes
         """
         return self._process_bios(identity)
+
+    def get_versions(self, identity):
+        """Get firmware versions section
+
+        If there are no firmware version attributes, domain is updated with
+        default values.
+
+        :param identity: libvirt domain name or ID
+        :returns: dict of firmware version attributes
+        """
+        return self._process_versions(identity)
 
     def set_bios(self, identity, attributes):
         """Update BIOS attributes
@@ -864,6 +1125,28 @@ class LibvirtDriver(AbstractSystemsDriver):
         self._process_bios(identity, bios_attributes,
                            update_existing_attributes=True)
 
+    def set_versions(self, identity, firmware_versions):
+        """Update firmware versions
+
+        These values do not have any effect on VM. This is a workaround
+        because there is no libvirt API to manage firmware versions.
+        By storing fake firmware versions they are attached to VM and are
+        persisted through VM lifecycle.
+
+        Updates to versions are immediate unlike in real firmware that
+        would require system reboot.
+
+        :param identity: libvirt domain name or ID
+        :param firmware_versions: dict of firmware versions to update.
+            Can pass only versions that need update, not all
+        """
+        versions = self.get_versions(identity)
+
+        versions.update(firmware_versions)
+
+        self._process_versions(identity, firmware_versions,
+                               update_existing_attributes=True)
+
     def reset_bios(self, identity):
         """Reset BIOS attributes to default
 
@@ -871,6 +1154,14 @@ class LibvirtDriver(AbstractSystemsDriver):
         """
         self._process_bios(identity, self.DEFAULT_BIOS_ATTRIBUTES,
                            update_existing_attributes=True)
+
+    def reset_versions(self, identity):
+        """Reset firmware versions to default
+
+        :param identity: libvirt domain name or ID
+        """
+        self._process_versions(identity, self.DEFAULT_FIRMWARE_VERSIONS,
+                               update_existing_attributes=True)
 
     def get_nics(self, identity):
         """Get list of network interfaces and their MAC addresses
@@ -1353,3 +1644,21 @@ class LibvirtDriver(AbstractSystemsDriver):
                     self._logger.debug(msg)
                     return
             return data['Id']
+
+    def get_http_boot_uri(self, identity):
+        """Return the URI stored for the HttpBootUri.
+
+        :param identity: The libvirt identity. Unused, exists for internal
+                         sushy-tools compatibility.
+        :returns: Stored URI value for HttpBootURI.
+        """
+        return self._http_boot_uri
+
+    def set_http_boot_uri(self, uri):
+        """Stores the Uri for HttpBootURI.
+
+        :param uri: String to return
+
+        :returns: None
+        """
+        self._http_boot_uri = uri

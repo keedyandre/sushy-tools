@@ -1,14 +1,16 @@
 {
-    "@odata.type": "#ComputerSystem.v1_1_0.ComputerSystem",
+    "@odata.type": "#ComputerSystem.v1_13_0.ComputerSystem",
     "Id": {{ identity|string|tojson }},
     "Name": {{ name|string|tojson }},
     "UUID": {{ uuid|string|tojson }},
+    {%- if feature_set == "full" %}
     "Manufacturer": "Sushy Emulator",
     "Status": {
         "State": "Enabled",
         "Health": "OK",
         "HealthRollUp": "OK"
     },
+    {% endif %}
     {%- if power_state %}
     "PowerState": {{ power_state|string|tojson }},
     {%- endif %}
@@ -19,22 +21,28 @@
         "BootSourceOverrideTarget@Redfish.AllowableValues": [
             "Pxe",
             "Cd",
-            "Hdd"
         {%- if boot_source_mode %}
+        {%- if uefi_mode %}
+            "Hdd",
+            "UefiHttp"
         ],
-        {%- if 'uefi' in boot_source_mode.lower() %}
         "BootSourceOverrideMode": {{ boot_source_mode|string|tojson }},
-        "UefiTargetBootSourceOverride": "/0x31/0x33/0x01/0x01"
+        "UefiTargetBootSourceOverride": "/0x31/0x33/0x01/0x01",
+        "HttpBootUri": {{ http_boot_uri|string|tojson }}
         {%- else %}
+            "Hdd"
+        ],
         "BootSourceOverrideMode": {{ boot_source_mode|string|tojson }}
         {%- endif %}
         {%- else %}
+	    "Hdd"
         ]
         {%- endif %}
         {%- else %}
         "BootSourceOverrideEnabled": "Continuous"
         {%- endif %}
     },
+    {%- if feature_set == "full" %}
     "ProcessorSummary": {
         {%- if total_cpus %}
         "Count": {{ total_cpus }},
@@ -58,14 +66,12 @@
     "Bios": {
         "@odata.id": {{ "/redfish/v1/Systems/%s/BIOS"|format(identity)|tojson }}
     },
+    "BiosVersion": {{ bios_version|string|tojson  }},
     "Processors": {
         "@odata.id": {{ "/redfish/v1/Systems/%s/Processors"|format(identity)|tojson }}
     },
     "Memory": {
         "@odata.id": {{ "/redfish/v1/Systems/%s/Memory"|format(identity)|tojson }}
-    },
-    "EthernetInterfaces": {
-        "@odata.id": {{ "/redfish/v1/Systems/%s/EthernetInterfaces"|format(identity)|tojson }}
     },
     "SecureBoot": {
         "@odata.id": {{ "/redfish/v1/Systems/%s/SecureBoot"|format(identity)|tojson }}
@@ -79,7 +85,17 @@
     {%- if indicator_led %}
     "IndicatorLED": {{ indicator_led|string|tojson }},
     {%- endif %}
+    {%- endif %}
+    {%- if feature_set != "minimum" %}
+    "EthernetInterfaces": {
+        "@odata.id": {{ "/redfish/v1/Systems/%s/EthernetInterfaces"|format(identity)|tojson }}
+    },
+    "VirtualMedia": {
+        "@odata.id": {{ "/redfish/v1/Systems/%s/VirtualMedia"|format(identity)|tojson }}
+    },
+    {%- endif %}
     "Links": {
+        {%- if feature_set == "full" %}
         "Chassis": [
             {%- for chassis_ in chassis %}
             {
@@ -87,6 +103,8 @@
             }{% if not loop.last %},{% endif %}
             {% endfor -%}
         ],
+        {% endif %}
+        {%- if feature_set != "minimum" %}
         "ManagedBy": [
             {%- for manager in managers %}
             {
@@ -94,6 +112,7 @@
             }{% if not loop.last %},{% endif %}
             {% endfor -%}
         ]
+        {% endif %}
     },
     "Actions": {
         "#ComputerSystem.Reset": {

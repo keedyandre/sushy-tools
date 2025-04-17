@@ -152,7 +152,8 @@ class LibvirtDriverTestCase(base.BaseTestCase):
 
         self.test_driver.set_power_state(self.uuid, 'ForceRestart')
 
-        domain_mock.reset.assert_called_once_with()
+        domain_mock.destroy.assert_called_once_with()
+        domain_mock.create.assert_called_once_with()
 
     @mock.patch('libvirt.open', autospec=True)
     def test_set_power_state_nmi(self, libvirt_mock):
@@ -363,7 +364,7 @@ class LibvirtDriverTestCase(base.BaseTestCase):
             for thedrive in newtree.find('devices').findall('disk')])
         self.assertEqual(2, diskdrives_order_sum)
 
-        # Check overal config to match expected fixture
+        # Check overall config to match expected fixture
         expected = '<domain type="qemu">\n  <name>QEmu-fedora-i686</name>\n '\
             ' <uuid>c7a5fdbd-cdaf-9455-926a-d65c16db1809</uuid>\n  '\
             '<memory>219200</memory>\n  '\
@@ -386,6 +387,27 @@ class LibvirtDriverTestCase(base.BaseTestCase):
             '<boot order="1" /></interface>\n    '\
             '<graphics type="vnc" port="-1" />\n  </devices>\n</domain>'
         self.assertIn(expected, conn_mock.defineXML.call_args[0][0])
+
+    def test__is_firmware_autoselection_disabled(self):
+        with open('sushy_tools/tests/unit/emulator/domain.xml', 'r') as f:
+            domain = f.read()
+
+        tree = ET.fromstring(domain)
+
+        fw_auto = self.test_driver._is_firmware_autoselection(tree)
+
+        self.assertEqual(False, fw_auto)
+
+    def test__is_firmware_autoselection_enabled(self):
+        with open(('sushy_tools/tests/unit/emulator/'
+                   'domain-q35_fw_auto_uefi.xml'), 'r') as f:
+            domain = f.read()
+
+        tree = ET.fromstring(domain)
+
+        fw_auto = self.test_driver._is_firmware_autoselection(tree)
+
+        self.assertEqual(True, fw_auto)
 
     @mock.patch('libvirt.openReadOnly', autospec=True)
     def test_get_boot_mode_legacy(self, libvirt_mock):
@@ -414,6 +436,20 @@ class LibvirtDriverTestCase(base.BaseTestCase):
 
         self.assertEqual('UEFI', boot_mode)
 
+    @mock.patch('libvirt.openReadOnly', autospec=True)
+    def test_get_boot_mode_fw_auto_uefi(self, libvirt_mock):
+        with open(('sushy_tools/tests/unit/emulator/'
+                   'domain-q35_fw_auto_uefi.xml'), 'r') as f:
+            data = f.read()
+
+        conn_mock = libvirt_mock.return_value
+        domain_mock = conn_mock.lookupByUUID.return_value
+        domain_mock.XMLDesc.return_value = data
+
+        boot_mode = self.test_driver.get_boot_mode(self.uuid)
+
+        self.assertEqual('UEFI', boot_mode)
+
     @mock.patch('libvirt.open', autospec=True)
     @mock.patch('libvirt.openReadOnly', autospec=True)
     def test_set_boot_mode(self, libvirt_mock, libvirt_rw_mock):
@@ -429,6 +465,58 @@ class LibvirtDriverTestCase(base.BaseTestCase):
             self.test_driver.set_boot_mode(self.uuid, 'UEFI')
 
         conn_mock = libvirt_rw_mock.return_value
+        conn_mock.defineXML.assert_called_once_with(mock.ANY)
+
+    @mock.patch('libvirt.open', autospec=True)
+    @mock.patch('libvirt.openReadOnly', autospec=True)
+    def test_set_boot_mode_auto_fw_uefi(self, libvirt_mock, libvirt_rw_mock):
+        with open('sushy_tools/tests/unit/emulator/'
+                  'domain_fw_auto.xml', 'r') as f:
+            data = f.read()
+
+        conn_mock = libvirt_rw_mock.return_value
+        domain_mock = conn_mock.lookupByUUID.return_value
+        domain_mock.XMLDesc.return_value = data
+
+        with mock.patch.object(
+                self.test_driver, 'get_power_state', return_value='Off'):
+            self.test_driver.set_boot_mode(self.uuid, 'UEFI')
+
+        conn_mock = libvirt_rw_mock.return_value
+        xml_document = conn_mock.defineXML.call_args[0][0]
+        tree = ET.fromstring(xml_document)
+        os_element = tree.find('os')
+        self.assertEqual('efi', os_element.get('firmware'))
+        secure_boot = os_element.findall(
+            './firmware/feature[@name="secure-boot"]')
+        self.assertEqual('secure-boot', secure_boot[0].get('name'))
+        self.assertEqual('no', secure_boot[0].get('enabled'))
+        conn_mock.defineXML.assert_called_once_with(mock.ANY)
+
+    @mock.patch('libvirt.open', autospec=True)
+    @mock.patch('libvirt.openReadOnly', autospec=True)
+    def test_set_boot_mode_auto_fw_legacy(self, libvirt_mock, libvirt_rw_mock):
+        with open('sushy_tools/tests/unit/emulator/'
+                  'domain-q35_fw_auto_uefi.xml', 'r') as f:
+            data = f.read()
+
+        conn_mock = libvirt_rw_mock.return_value
+        domain_mock = conn_mock.lookupByUUID.return_value
+        domain_mock.XMLDesc.return_value = data
+
+        with mock.patch.object(
+                self.test_driver, 'get_power_state', return_value='Off'):
+            self.test_driver.set_boot_mode(self.uuid, 'Legacy')
+
+        conn_mock = libvirt_rw_mock.return_value
+        xml_document = conn_mock.defineXML.call_args[0][0]
+        tree = ET.fromstring(xml_document)
+        os_element = tree.find('os')
+        self.assertEqual('bios', os_element.get('firmware'))
+        # There should be no secure-boot feature element
+        secure_boot = os_element.findall(
+            './firmware/feature[@name="secure-boot"]')
+        self.assertEqual([], secure_boot)
         conn_mock.defineXML.assert_called_once_with(mock.ANY)
 
     @mock.patch('libvirt.open', autospec=True)
@@ -944,6 +1032,12 @@ class LibvirtDriverTestCase(base.BaseTestCase):
                              .find('sushy:bios', ns)
                              .find('sushy:attributes', ns))
 
+    def _assert_versions_xml(self, tree):
+        ns = {'sushy': 'http://openstack.org/xmlns/libvirt/sushy'}
+        self.assertIsNotNone(tree.find('metadata')
+                             .find('sushy:bios', ns)
+                             .find('sushy:versions', ns))
+
     @mock.patch('libvirt.open', autospec=True)
     def test__process_bios_error(self, libvirt_mock):
         with open('sushy_tools/tests/unit/emulator/domain.xml') as f:
@@ -960,6 +1054,136 @@ class LibvirtDriverTestCase(base.BaseTestCase):
                           'xxx-yyy-zzz',
                           {"BootMode": "Uefi",
                            "ProcTurboMode": "Enabled"})
+
+    @mock.patch('libvirt.open', autospec=True)
+    def test_get_versions(self, libvirt_mock):
+        with open('sushy_tools/tests/unit/emulator/domain.xml') as f:
+            domain_xml = f.read()
+
+        conn_mock = libvirt_mock.return_value
+        domain_mock = conn_mock.lookupByUUID.return_value
+        domain_mock.XMLDesc.return_value = domain_xml
+
+        firmware_versions = self.test_driver.get_versions(self.uuid)
+        self.assertEqual(LibvirtDriver.DEFAULT_FIRMWARE_VERSIONS,
+                         firmware_versions)
+        conn_mock.defineXML.assert_called_once_with(mock.ANY)
+
+    @mock.patch('libvirt.open', autospec=True)
+    def test_get_versions_existing(self, libvirt_mock):
+        with open('sushy_tools/tests/unit/emulator/domain_versions.xml') as f:
+            domain_xml = f.read()
+
+        conn_mock = libvirt_mock.return_value
+        domain_mock = conn_mock.lookupByUUID.return_value
+        domain_mock.XMLDesc.return_value = domain_xml
+
+        versions = self.test_driver.get_versions(self.uuid)
+        self.assertEqual({"BiosVersion": "1.0.0"},
+                         versions)
+        conn_mock.defineXML.assert_not_called()
+
+    @mock.patch('libvirt.open', autospec=True)
+    def test_set_versions(self, libvirt_mock):
+        with open('sushy_tools/tests/unit/emulator/domain_versions.xml') as f:
+            domain_xml = f.read()
+
+        conn_mock = libvirt_mock.return_value
+        domain_mock = conn_mock.lookupByUUID.return_value
+        domain_mock.XMLDesc.return_value = domain_xml
+
+        with mock.patch.object(
+                self.test_driver, 'get_power_state', return_value='Off'):
+            self.test_driver.set_versions(
+                self.uuid, {"BiosVersion": "1.1.0"})
+
+        conn_mock.defineXML.assert_called_once_with(mock.ANY)
+
+    @mock.patch('libvirt.open', autospec=True)
+    def test_reset_versions(self, libvirt_mock):
+        with open('sushy_tools/tests/unit/emulator/domain_versions.xml') as f:
+            domain_xml = f.read()
+
+        conn_mock = libvirt_mock.return_value
+        domain_mock = conn_mock.lookupByUUID.return_value
+        domain_mock.XMLDesc.return_value = domain_xml
+
+        with mock.patch.object(
+                self.test_driver, 'get_power_state', return_value='Off'):
+            self.test_driver.reset_versions(self.uuid)
+
+        conn_mock.defineXML.assert_called_once_with(mock.ANY)
+
+    def test__process_versions_attributes_get_default(self):
+        with open('sushy_tools/tests/unit/emulator/domain.xml') as f:
+            domain_xml = f.read()
+
+        result = self.test_driver._process_versions_attributes(domain_xml)
+        self.assertTrue(result.attributes_written)
+        self.assertEqual(LibvirtDriver.DEFAULT_FIRMWARE_VERSIONS,
+                         result.firmware_versions)
+        self._assert_versions_xml(result.tree)
+
+    def test__process_versions_attributes_get_default_metadata_exists(self):
+        with open('sushy_tools/tests/unit/emulator/'
+                  'domain_metadata.xml') as f:
+            domain_xml = f.read()
+
+        result = self.test_driver._process_versions_attributes(domain_xml)
+        self.assertTrue(result.attributes_written)
+        self.assertEqual(LibvirtDriver.DEFAULT_FIRMWARE_VERSIONS,
+                         result.firmware_versions)
+        self._assert_versions_xml(result.tree)
+
+    def test__process_versions_attributes_get_existing(self):
+        with open('sushy_tools/tests/unit/emulator/domain_versions.xml') as f:
+            domain_xml = f.read()
+
+        result = self.test_driver._process_versions_attributes(domain_xml)
+        self.assertFalse(result.attributes_written)
+        self.assertEqual({"BiosVersion": "1.0.0"},
+                         result.firmware_versions)
+        self._assert_versions_xml(result.tree)
+
+    def test__process_versions_attributes_update(self):
+        with open('sushy_tools/tests/unit/emulator/domain_versions.xml') as f:
+            domain_xml = f.read()
+        result = self.test_driver._process_versions_attributes(
+            domain_xml,
+            {"BiosVersion": "2.0.0"},
+            True)
+        self.assertTrue(result.attributes_written)
+        self.assertEqual({"BiosVersion": "2.0.0"},
+                         result.firmware_versions)
+        self._assert_versions_xml(result.tree)
+
+    def test__process_versions_attributes_update_non_string(self):
+        with open('sushy_tools/tests/unit/emulator/domain_versions.xml') as f:
+            domain_xml = f.read()
+        result = self.test_driver._process_versions_attributes(
+            domain_xml,
+            {"BiosVersion": 42},
+            True)
+        self.assertTrue(result.attributes_written)
+        self.assertEqual({"BiosVersion": "42"},
+                         result.firmware_versions)
+        self._assert_versions_xml(result.tree)
+
+    @mock.patch('libvirt.open', autospec=True)
+    def test__process_versions_error(self, libvirt_mock):
+        with open('sushy_tools/tests/unit/emulator/domain.xml') as f:
+            domain_xml = f.read()
+
+        conn_mock = libvirt_mock.return_value
+        domain_mock = conn_mock.lookupByUUID.return_value
+        domain_mock.XMLDesc.return_value = domain_xml
+        conn_mock.defineXML.side_effect = libvirt.libvirtError(
+            'because I can')
+
+        self.assertRaises(error.FishyError,
+                          self.test_driver._process_bios,
+                          'xxx-yyy-zzz',
+                          {"BiosVersion" "1.0.0"})
 
     @mock.patch('libvirt.openReadOnly', autospec=True)
     def test_get_nics(self, libvirt_mock):
@@ -1156,9 +1380,33 @@ class LibvirtDriverTestCase(base.BaseTestCase):
         self.assertFalse(self.test_driver.get_secure_boot(self.uuid))
 
     @mock.patch('libvirt.openReadOnly', autospec=True)
+    def test_get_secure_boot_fw_auto_off(self, libvirt_mock):
+        with open('sushy_tools/tests/unit/emulator/'
+                  'domain-q35_fw_auto_uefi.xml', 'r') as f:
+            data = f.read()
+
+        conn_mock = libvirt_mock.return_value
+        domain_mock = conn_mock.lookupByUUID.return_value
+        domain_mock.XMLDesc.return_value = data
+
+        self.assertFalse(self.test_driver.get_secure_boot(self.uuid))
+
+    @mock.patch('libvirt.openReadOnly', autospec=True)
     def test_get_secure_boot_on(self, libvirt_mock):
         with open('sushy_tools/tests/unit/emulator/domain-q35_uefi_secure.xml',
                   'r') as f:
+            data = f.read()
+
+        conn_mock = libvirt_mock.return_value
+        domain_mock = conn_mock.lookupByUUID.return_value
+        domain_mock.XMLDesc.return_value = data
+
+        self.assertTrue(self.test_driver.get_secure_boot(self.uuid))
+
+    @mock.patch('libvirt.openReadOnly', autospec=True)
+    def test_get_secure_boot_fw_auto_on(self, libvirt_mock):
+        with open('sushy_tools/tests/unit/emulator/'
+                  'domain-q35_fw_auto_uefi_secure.xml', 'r') as f:
             data = f.read()
 
         conn_mock = libvirt_mock.return_value
@@ -1203,8 +1451,8 @@ class LibvirtDriverTestCase(base.BaseTestCase):
                          loader_element.text)
         self.assertEqual('/usr/share/OVMF/OVMF_VARS.secboot.fd',
                          nvram_element.get('template'))
-        self.assertEqual('/var/lib/libvirt/nvram-%s.secboot.fd' %
-                         self.uuid, nvram_element.text)
+        self.assertEqual('/var/lib/libvirt/nvram/%s_VARS.secboot.fd' %
+                         self.name, nvram_element.text)
 
     @mock.patch('libvirt.open', autospec=True)
     @mock.patch('libvirt.openReadOnly', autospec=True)
@@ -1230,8 +1478,8 @@ class LibvirtDriverTestCase(base.BaseTestCase):
                          loader_element.text)
         self.assertEqual('/usr/share/OVMF/OVMF_VARS.fd',
                          nvram_element.get('template'))
-        self.assertEqual('/var/lib/libvirt/nvram-%s.fd' %
-                         self.uuid, nvram_element.text)
+        self.assertEqual('/var/lib/libvirt/nvram/%s_VARS.nosecboot.fd' %
+                         self.name, nvram_element.text)
 
     @mock.patch('libvirt.open', autospec=True)
     @mock.patch('libvirt.openReadOnly', autospec=True)
@@ -1245,3 +1493,65 @@ class LibvirtDriverTestCase(base.BaseTestCase):
 
         self.assertRaises(error.NotSupportedError,
                           self.test_driver.set_secure_boot, self.uuid, True)
+
+    @mock.patch('libvirt.open', autospec=True)
+    @mock.patch('libvirt.openReadOnly', autospec=True)
+    def test_set_get_http_boot_uri(self, libvirt_mock, libvirt_rw_mock):
+        with open('sushy_tools/tests/unit/emulator/domain-q35.xml', 'r') as f:
+            data = f.read()
+
+        conn_mock = libvirt_mock.return_value
+        domain_mock = conn_mock.lookupByUUID.return_value
+        domain_mock.XMLDesc.return_value = data
+        self.assertIsNone(self.test_driver.get_http_boot_uri(None))
+        uri = 'http://host.path/meow'
+        self.test_driver.set_http_boot_uri(uri)
+        self.assertEqual(uri, self.test_driver.get_http_boot_uri(None))
+
+    @mock.patch('libvirt.open', autospec=True)
+    @mock.patch('libvirt.openReadOnly', autospec=True)
+    def test_set_secure_boot_on_auto_fw(self, libvirt_mock, libvirt_rw_mock):
+        with open('sushy_tools/tests/unit/emulator/'
+                  'domain-q35_fw_auto_uefi.xml', 'r') as f:
+            data = f.read()
+
+        conn_mock = libvirt_mock.return_value
+        domain_mock = conn_mock.lookupByUUID.return_value
+        domain_mock.XMLDesc.return_value = data
+
+        self.test_driver.set_secure_boot(self.uuid, True)
+
+        conn_mock = libvirt_rw_mock.return_value
+        xml_document = conn_mock.defineXML.call_args[0][0]
+        tree = ET.fromstring(xml_document)
+        os_element = tree.find('os')
+        self.assertEqual('efi', os_element.get('firmware'))
+        secure_boot = os_element.findall(
+            './firmware/feature[@name="secure-boot"]')
+        self.assertEqual('secure-boot', secure_boot[0].get('name'))
+        self.assertEqual('yes', secure_boot[0].get('enabled'))
+        conn_mock.defineXML.assert_called_once_with(mock.ANY)
+
+    @mock.patch('libvirt.open', autospec=True)
+    @mock.patch('libvirt.openReadOnly', autospec=True)
+    def test_set_secure_boot_off_auto_fw(self, libvirt_mock, libvirt_rw_mock):
+        with open('sushy_tools/tests/unit/emulator/'
+                  'domain-q35_fw_auto_uefi_secure.xml', 'r') as f:
+            data = f.read()
+
+        conn_mock = libvirt_mock.return_value
+        domain_mock = conn_mock.lookupByUUID.return_value
+        domain_mock.XMLDesc.return_value = data
+
+        self.test_driver.set_secure_boot(self.uuid, False)
+
+        conn_mock = libvirt_rw_mock.return_value
+        xml_document = conn_mock.defineXML.call_args[0][0]
+        tree = ET.fromstring(xml_document)
+        os_element = tree.find('os')
+        self.assertEqual('efi', os_element.get('firmware'))
+        secure_boot = os_element.findall(
+            './firmware/feature[@name="secure-boot"]')
+        self.assertEqual('secure-boot', secure_boot[0].get('name'))
+        self.assertEqual('no', secure_boot[0].get('enabled'))
+        conn_mock.defineXML.assert_called_once_with(mock.ANY)

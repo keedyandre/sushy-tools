@@ -167,6 +167,15 @@ class AbstractSystemsDriver(metaclass=abc.ABCMeta):
         """
         raise error.NotSupportedError('Not implemented')
 
+    def get_versions(self, identity):
+        """Get firmware version information for the system
+
+        :returns: key-value pairs of firmware versions
+
+        :raises: `FishyError` if firmware versions cannot be processed
+        """
+        raise error.NotSupportedError('Not implemented')
+
     def set_bios(self, identity, attributes):
         """Update BIOS attributes
 
@@ -176,10 +185,26 @@ class AbstractSystemsDriver(metaclass=abc.ABCMeta):
         """
         raise error.NotSupportedError('Not implemented')
 
+    def set_versions(self, identity, firmware_versions):
+        """Update firmware versions
+
+        :param firmware_versions: key-value pairs of versions to update
+
+        :raises: `FishyError` if firmware versions cannot be processed
+        """
+        raise error.NotSupportedError('Not implemented')
+
     def reset_bios(self, identity):
         """Reset BIOS attributes to default
 
         :raises: `FishyError` if BIOS attributes cannot be processed
+        """
+        raise error.NotSupportedError('Not implemented')
+
+    def reset_versions(self, identity):
+        """Reset firmware versions to default
+
+        :raises: `FishyError` if firmware versions cannot be processed
         """
         raise error.NotSupportedError('Not implemented')
 
@@ -219,7 +244,7 @@ class AbstractSystemsDriver(metaclass=abc.ABCMeta):
     def get_simple_storage_collection(self, identity):
         """Get a dict of Simple Storage Controllers and their devices
 
-        :returns: dict of Simple Storage Controllers and their atributes
+        :returns: dict of Simple Storage Controllers and their attributes
         """
         raise error.NotSupportedError('Not implemented')
 
@@ -231,5 +256,23 @@ class AbstractSystemsDriver(metaclass=abc.ABCMeta):
                      and `libvirtVolName`
 
         :returns: Id of the volume if successfully found/created else None
+        """
+        raise error.NotSupportedError('Not implemented')
+
+    def get_http_boot_uri(self, identity):
+        """Return the URI stored for the HttpBootUri.
+
+        :param identity: The libvirt identity. Unused, exists for internal
+                         sushy-tools compatibility.
+        :returns: Stored URI value for HttpBootURI.
+        """
+        raise error.NotSupportedError('Not implemented')
+
+    def set_http_boot_uri(self, uri):
+        """Stores the Uri for HttpBootURI.
+
+        :param uri: String to return
+
+        :returns: None
         """
         raise error.NotSupportedError('Not implemented')

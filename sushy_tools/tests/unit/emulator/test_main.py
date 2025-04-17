@@ -36,6 +36,12 @@ class EmulatorTestCase(base.BaseTestCase):
 
         super(EmulatorTestCase, self).setUp()
 
+    def set_feature_set(self, new_feature_set):
+        main.app.config['SUSHY_EMULATOR_FEATURE_SET'] = new_feature_set
+        self.addCleanup(
+            lambda: main.app.config.pop('SUSHY_EMULATOR_FEATURE_SET', None)
+        )
+
 
 class CommonTestCase(EmulatorTestCase):
 
@@ -51,6 +57,22 @@ class CommonTestCase(EmulatorTestCase):
         response = self.app.get('/redfish/v1/')
         self.assertEqual(200, response.status_code)
         self.assertEqual('RedvirtService', response.json['Id'])
+
+    def test_root_resource_only_vmedia(self):
+        self.set_feature_set("vmedia")
+        response = self.app.get('/redfish/v1/')
+        self.assertEqual(200, response.status_code)
+        self.assertEqual(
+            {'Id', 'Name', 'RedfishVersion', 'UUID', 'Systems', 'Managers'},
+            {x for x in response.json if not x.startswith('@')})
+
+    def test_root_resource_minimum(self):
+        self.set_feature_set("minimum")
+        response = self.app.get('/redfish/v1/')
+        self.assertEqual(200, response.status_code)
+        self.assertEqual(
+            {'Id', 'Name', 'RedfishVersion', 'UUID', 'Systems'},
+            {x for x in response.json if not x.startswith('@')})
 
 
 TEST_PASSWD = \
@@ -210,6 +232,33 @@ class ManagersTestCase(EmulatorTestCase):
                          response.json['Links']['ManagerForServers'])
         self.assertEqual([{'@odata.id': '/redfish/v1/Chassis/chassis0'}],
                          response.json['Links']['ManagerForChassis'])
+        self.assertEqual({'@odata.id': '/redfish/v1/Systems/xxx/VirtualMedia'},
+                         response.json['VirtualMedia'])
+
+    @patch_resource('managers')
+    def test_manager_resource_get_reduced_feature_set(self, managers_mock):
+        self.set_feature_set("vmedia")
+        managers_mock = managers_mock.return_value
+        managers_mock.managers = ['xxxx-yyyy-zzzz']
+        managers_mock.get_manager.return_value = {
+            'UUID': 'xxxx-yyyy-zzzz',
+            'Name': 'name',
+            'Id': 'xxxx-yyyy-zzzz',
+        }
+        managers_mock.get_managed_systems.return_value = ['xxx']
+        managers_mock.get_managed_chassis.return_value = ['chassis0']
+
+        response = self.app.get('/redfish/v1/Managers/xxxx-yyyy-zzzz')
+
+        self.assertEqual(200, response.status_code, response.json)
+        self.assertEqual('xxxx-yyyy-zzzz', response.json['Id'])
+        self.assertEqual('xxxx-yyyy-zzzz', response.json['UUID'])
+        self.assertNotIn('ServiceEntryPointUUID', response.json)
+        self.assertEqual([{'@odata.id': '/redfish/v1/Systems/xxx'}],
+                         response.json['Links']['ManagerForServers'])
+        self.assertNotIn('Chassis', response.json['Links'])
+        self.assertEqual({'@odata.id': '/redfish/v1/Systems/xxx/VirtualMedia'},
+                         response.json['VirtualMedia'])
 
 
 class SystemsTestCase(EmulatorTestCase):
@@ -263,6 +312,81 @@ class SystemsTestCase(EmulatorTestCase):
         self.assertEqual(
             [{'@odata.id': '/redfish/v1/Chassis/chassis0'}],
             response.json['Links']['Chassis'])
+        self.assertEqual(
+            {'@odata.id': '/redfish/v1/Systems/xxxx-yyyy-zzzz/VirtualMedia'},
+            response.json['VirtualMedia'])
+
+    @patch_resource('indicators')
+    @patch_resource('chassis')
+    @patch_resource('managers')
+    @patch_resource('systems')
+    def test_system_resource_get_reduced_feature_set(
+            self, systems_mock, managers_mock, chassis_mock, indicators_mock):
+        self.set_feature_set("vmedia")
+        systems_mock = systems_mock.return_value
+        systems_mock.uuid.return_value = 'zzzz-yyyy-xxxx'
+        systems_mock.get_power_state.return_value = 'On'
+        systems_mock.get_boot_device.return_value = 'Cd'
+        systems_mock.get_boot_mode.return_value = 'Legacy'
+        managers_mock.return_value.get_managers_for_system.return_value = [
+            'aaaa-bbbb-cccc']
+
+        response = self.app.get('/redfish/v1/Systems/xxxx-yyyy-zzzz')
+
+        self.assertEqual(200, response.status_code)
+        self.assertEqual('xxxx-yyyy-zzzz', response.json['Id'])
+        self.assertEqual('zzzz-yyyy-xxxx', response.json['UUID'])
+        self.assertEqual('On', response.json['PowerState'])
+        self.assertNotIn('IndicatorLED', response.json)
+        self.assertNotIn('MemorySummary', response.json)
+        self.assertNotIn('ProcessorSummary', response.json)
+        self.assertNotIn('BiosVersion', response.json)
+        self.assertNotIn('Bios', response.json)
+        self.assertEqual(
+            'Cd', response.json['Boot']['BootSourceOverrideTarget'])
+        self.assertEqual(
+            'Legacy', response.json['Boot']['BootSourceOverrideMode'])
+        self.assertEqual(
+            [{'@odata.id': '/redfish/v1/Managers/aaaa-bbbb-cccc'}],
+            response.json['Links']['ManagedBy'])
+        self.assertNotIn('Chassis', response.json['Links'])
+        self.assertEqual(
+            {'@odata.id': '/redfish/v1/Systems/xxxx-yyyy-zzzz/VirtualMedia'},
+            response.json['VirtualMedia'])
+
+    @patch_resource('indicators')
+    @patch_resource('chassis')
+    @patch_resource('managers')
+    @patch_resource('systems')
+    def test_system_resource_get_minimum_feature_set(
+            self, systems_mock, managers_mock, chassis_mock, indicators_mock):
+        self.set_feature_set("minimum")
+        systems_mock = systems_mock.return_value
+        systems_mock.uuid.return_value = 'zzzz-yyyy-xxxx'
+        systems_mock.get_power_state.return_value = 'On'
+        systems_mock.get_boot_device.return_value = 'Cd'
+        systems_mock.get_boot_mode.return_value = 'Legacy'
+        managers_mock.return_value.get_managers_for_system.return_value = [
+            'aaaa-bbbb-cccc']
+
+        response = self.app.get('/redfish/v1/Systems/xxxx-yyyy-zzzz')
+
+        self.assertEqual(200, response.status_code)
+        self.assertEqual('xxxx-yyyy-zzzz', response.json['Id'])
+        self.assertEqual('zzzz-yyyy-xxxx', response.json['UUID'])
+        self.assertEqual('On', response.json['PowerState'])
+        self.assertNotIn('IndicatorLED', response.json)
+        self.assertNotIn('MemorySummary', response.json)
+        self.assertNotIn('ProcessorSummary', response.json)
+        self.assertNotIn('BiosVersion', response.json)
+        self.assertNotIn('Bios', response.json)
+        self.assertEqual(
+            'Cd', response.json['Boot']['BootSourceOverrideTarget'])
+        self.assertEqual(
+            'Legacy', response.json['Boot']['BootSourceOverrideMode'])
+        self.assertNotIn('ManagedBy', response.json['Links'])
+        self.assertNotIn('Chassis', response.json['Links'])
+        self.assertNotIn('VirtualMedia', response.json)
 
     @patch_resource('systems')
     def test_system_resource_patch(self, systems_mock):
@@ -273,11 +397,37 @@ class SystemsTestCase(EmulatorTestCase):
         set_boot_device = systems_mock.return_value.set_boot_device
         set_boot_device.assert_called_once_with('xxxx-yyyy-zzzz', 'Cd')
 
+    @patch_resource('vmedia')
     @patch_resource('systems')
-    def test_system_reset_action(self, systems_mock):
+    def test_system_boot_http_uri(self, systems_mock, vmedia_mock):
+        data = {'Boot': {'BootSourceOverrideMode': 'UEFI',
+                         'BootSourceOverrideTarget': 'UefiHttp',
+                         'HttpBootUri': 'http://test.url/boot.iso'}}
+        insert_image = vmedia_mock.return_value.insert_image
+        insert_image.return_value = '/path/to/file.iso'
+        response = self.app.patch('/redfish/v1/Systems/xxxx-yyyy-zzzz',
+                                  json=data)
+        self.assertEqual(204, response.status_code)
+        insert_image.assert_called_once_with('xxxx-yyyy-zzzz', 'Cd',
+                                             'http://test.url/boot.iso')
+        set_boot_device = systems_mock.return_value.set_boot_device
+        set_boot_image = systems_mock.return_value.set_boot_image
+        set_boot_mode = systems_mock.return_value.set_boot_mode
+        set_http_boot_uri = systems_mock.return_value.set_http_boot_uri
+        set_boot_device.assert_called_once_with('xxxx-yyyy-zzzz', 'Cd')
+        set_boot_image.assert_called_once_with(
+            mock.ANY,
+            'Cd',
+            boot_image='/path/to/file.iso',
+            write_protected=True)
+        set_boot_mode.assert_called_once_with('xxxx-yyyy-zzzz', 'UEFI')
+        set_http_boot_uri.assert_called_once_with('http://test.url/boot.iso')
+
+    @patch_resource('systems')
+    def test_system_reset_action_ok(self, systems_mock):
         set_power_state = systems_mock.return_value.set_power_state
-        for reset_type in ('On', 'ForceOn', 'ForceOff', 'GracefulShutdown',
-                           'GracefulRestart', 'ForceRestart', 'Nmi'):
+        for reset_type in ('On', 'ForceOn', 'GracefulRestart', 'ForceRestart',
+                           'Nmi'):
             set_power_state.reset_mock()
             data = {'ResetType': reset_type}
             response = self.app.post(
@@ -287,6 +437,19 @@ class SystemsTestCase(EmulatorTestCase):
             self.assertEqual(204, response.status_code)
             set_power_state.assert_called_once_with('xxxx-yyyy-zzzz',
                                                     reset_type)
+
+    @patch_resource('systems')
+    def test_system_reset_action_fail(self, systems_mock):
+        self.app.application.config['SUSHY_EMULATOR_DISABLE_POWER_OFF'] = True
+        print(self.app.application.config)
+
+        for reset_type in ('ForceOff', 'GracefulShutdown'):
+            data = {'ResetType': reset_type}
+            response = self.app.post(
+                '/redfish/v1/Systems/xxxx-yyyy-zzzz/Actions/'
+                'ComputerSystem.Reset',
+                json=data)
+            self.assertEqual(400, response.status_code)
 
     @patch_resource('indicators')
     @patch_resource('systems')
@@ -309,6 +472,18 @@ class SystemsTestCase(EmulatorTestCase):
         response = self.app.patch('/redfish/v1/Systems/xxxx-yyyy-zzzz',
                                   json=data)
         self.assertEqual(500, response.status_code)
+
+    @patch_resource('indicators')
+    @patch_resource('systems')
+    def test_system_indicator_reduced_feature_set(self, systems_mock,
+                                                  indicators_mock):
+        self.set_feature_set("vmedia")
+        systems_mock.return_value.uuid.return_value = self.uuid
+
+        data = {'IndicatorLED': 'Off'}
+        response = self.app.patch('/redfish/v1/Systems/xxxx-yyyy-zzzz',
+                                  json=data)
+        self.assertEqual(400, response.status_code)
 
 
 @patch_resource('systems')
@@ -813,3 +988,22 @@ class RegistryTestCase(EmulatorTestCase):
                           "NumberOfArgs": 0,
                           "Resolution": "No response action is required."},
                          messages['BIOS001'])
+
+
+class TaskServiceTestCase(EmulatorTestCase):
+
+    def test_task_service(self):
+        response = self.app.get('/redfish/v1/TaskService')
+        self.assertEqual(200, response.status_code)
+        self.assertEqual('/redfish/v1/TaskService',
+                         response.json['@odata.id'])
+        self.assertEqual('Tasks Service', response.json['Name'])
+        self.assertEqual(True, response.json['ServiceEnabled'])
+
+    def test_task_service_task(self):
+        response = self.app.get('/redfish/v1/TaskService/Tasks/42')
+        self.assertEqual(200, response.status_code)
+        self.assertEqual('/redfish/v1/TaskService/Tasks/42',
+                         response.json['@odata.id'])
+        self.assertEqual('Task 42', response.json['Name'])
+        self.assertEqual('Completed', response.json['TaskState'])

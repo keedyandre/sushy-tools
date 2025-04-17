@@ -13,7 +13,12 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+import base64
+from concurrent import futures
 import math
+import os
+import time
+from urllib import parse as urlparse
 
 from sushy_tools.emulator import memoize
 from sushy_tools.emulator.resources.systems.base import AbstractSystemsDriver
@@ -27,6 +32,8 @@ except ImportError:
 
 
 is_loaded = bool(openstack)
+
+FUTURES = {}
 
 
 class OpenStackDriver(AbstractSystemsDriver):
@@ -58,6 +65,7 @@ class OpenStackDriver(AbstractSystemsDriver):
         cls._os_cloud = os_cloud
 
         cls._cc = openstack.connect(cloud=os_cloud)
+        cls._executor = futures.ThreadPoolExecutor(max_workers=4)
 
         return cls
 
@@ -85,13 +93,43 @@ class OpenStackDriver(AbstractSystemsDriver):
 
     @memoize.memoize(permanent_cache=PERMANENT_CACHE)
     def _get_image_info(self, identity):
+        if not identity:
+            return
         return self._cc.image.find_image(identity)
+
+    @memoize.memoize(permanent_cache=PERMANENT_CACHE)
+    def _get_volume_info(self, identity):
+        if not identity:
+            return
+        return self._cc.volume.get_volume(identity)
+
+    def _get_instance_image_id(self, instance):
+        # instance.image.id is always None for boot from volume instance
+        image_id = instance.image.get('id')
+
+        if image_id is None and len(instance.attached_volumes) > 0:
+            vol = self._get_volume_info(instance.attached_volumes[0].id)
+            image_id = vol.volume_image_metadata.get('image_id')
+
+        return image_id
 
     def _get_server_metadata(self, identity):
         return self._cc.compute.get_server_metadata(identity).to_dict()
 
     def _set_server_metadata(self, identity, metadata):
         self._cc.compute.set_server_metadata(identity, metadata)
+
+    @property
+    def _futures(self):
+        return FUTURES
+
+    @property
+    def connection(self):
+        """Return openstack connection
+
+        :returns: Connection object
+        """
+        return self._cc
 
     @property
     def driver(self):
@@ -107,7 +145,7 @@ class OpenStackDriver(AbstractSystemsDriver):
 
         :returns: list of UUIDs representing the systems
         """
-        return [server.id for server in self._cc.list_servers()]
+        return [server.id for server in self._cc.list_servers(bare=True)]
 
     def uuid(self, identity):
         """Get computer system UUID by name
@@ -160,6 +198,24 @@ class OpenStackDriver(AbstractSystemsDriver):
 
         """
         instance = self._get_instance(identity)
+        delayed_media_eject = instance.metadata.get('sushy-tools-delay-eject')
+
+        if delayed_media_eject:
+            self._logger.debug(
+                'Create task to rebuild with blank-image for %(identity)s' %
+                {'identity': identity})
+            # Not running async here, as long as the blank image used is small
+            # this should finish in ~20 seconds.
+            self._submit_future(
+                False, self._rebuild_with_blank_image, identity)
+            self._remove_delayed_eject_metadata(identity)
+
+        if instance.task_state is not None:
+            # SYS518 is used here to trick openstack/sushy to do retries.
+            # iDRAC uses SYS518 when a previous task is still running.
+            msg = ('SYS518: Cloud instance is busy, task_state: %s'
+                   % instance.task_state)
+            raise error.FishyError(msg, 503)
 
         if state in ('On', 'ForceOn'):
             if instance.power_state != self.NOVA_POWER_STATE_ON:
@@ -251,9 +307,14 @@ class OpenStackDriver(AbstractSystemsDriver):
         """
         instance = self._get_instance(identity)
 
-        image = self._get_image_info(instance.image['id'])
-
-        hw_firmware_type = getattr(image, 'hw_firmware_type', None)
+        hw_firmware_type = None
+        if instance.image.get('id') is not None:
+            image = self._get_image_info(instance.image['id'])
+            hw_firmware_type = getattr(image, 'hw_firmware_type', None)
+        elif len(instance.attached_volumes) > 0:
+            vol = self._get_volume_info(instance.attached_volumes[0].id)
+            hw_firmware_type = vol.volume_image_metadata.get(
+                'hw_firmware_type')
 
         return self.BOOT_MODE_MAP_REV.get(hw_firmware_type)
 
@@ -286,9 +347,15 @@ class OpenStackDriver(AbstractSystemsDriver):
 
         instance = self._get_instance(identity)
 
-        image = self._get_image_info(instance.image['id'])
+        os_secure_boot = None
+        if instance.image.get('id') is not None:
+            image = self._get_image_info(instance.image['id'])
+            os_secure_boot = getattr(image, 'os_secure_boot', None)
+        elif len(instance.attached_volumes) > 0:
+            vol = self._get_volume_info(instance.attached_volumes[0].id)
+            os_secure_boot = vol.volume_image_metadata.get('os_secure_boot')
 
-        return getattr(image, 'os_secure_boot', None) == 'required'
+        return os_secure_boot == 'required'
 
     def set_secure_boot(self, identity, secure):
         """Set computer system secure boot state for UEFI boot mode.
@@ -356,3 +423,315 @@ class OpenStackDriver(AbstractSystemsDriver):
                         'Could not find MAC address in %s', adr)
         return [{'id': mac, 'mac': mac}
                 for mac in macs]
+
+    def get_boot_image(self, identity, device):
+        """Get backend VM boot image info
+
+        :param identity: node name or ID
+        :param device: device type (from
+            `sushy_tools.emulator.constants`)
+        :returns: a `tuple` of (boot_image, write_protected, inserted)
+        :raises: `error.FishyError` if boot device can't be accessed
+        """
+        instance = self._get_instance(identity)
+        image_id = self._get_instance_image_id(instance)
+
+        return image_id, False, True
+
+    def set_boot_image(self, identity, device, boot_image=None,
+                       write_protected=True):
+        """Set backend VM boot image
+
+        :param identity: node name or ID
+        :param device: device type (from
+            `sushy_tools.emulator.constants`)
+        :param boot_image: ID of the image, or `None` to switch to
+            boot from volume
+        :param write_protected: expose media as read-only or writable
+
+        :raises: `error.FishyError` if boot device can't be set
+        """
+        instance = self._get_instance(identity)
+        instance_image = self._get_instance_image_id(instance)
+
+        if instance_image == boot_image:
+            msg = ('Image %(identity)s already has image %(boot_image)s. '
+                   'Skipping rebuild.' % {'identity': identity,
+                                          'boot_image': boot_image})
+            self._logger.debug(msg)
+
+        elif boot_image is None:
+            if self._config.get('SUSHY_EMULATOR_OS_VMEDIA_DELAY_EJECT', True):
+                self._logger.debug(
+                    'Set instance metadata for vmedia eject on next power '
+                    'action for %(identity)s' % {'identity': identity})
+                server_metadata = {'sushy-tools-delay-eject': 'true'}
+                self._cc.set_server_metadata(identity, server_metadata)
+            else:
+                self._logger.debug(
+                    'Create task to rebuild with blank-image for '
+                    '%(identity)s' % {'identity': identity})
+                # Not running async here, as long as the blank image used is
+                # small this should finish in ~20 seconds.
+                self._submit_future(
+                    False, self._rebuild_with_blank_image, identity)
+
+        else:
+            if self._config.get('SUSHY_EMULATOR_OS_VMEDIA_DELAY_EJECT', True):
+                # Make sure sushy-tools-delay-eject is cleared when media is
+                # inserted. Avoid race in case media is ejected and then
+                # inserted without a power action.
+                self._remove_delayed_eject_metadata(identity)
+
+            self._logger.debug(
+                'Creating task to finish import and rebuild for %(identity)s' %
+                {'identity': identity})
+            self._submit_future(
+                True, self._rebuild_with_imported_image, identity, boot_image)
+
+    def insert_image(self, identity, image_url, local_file_path=None):
+        self._logger.debug(
+            'Creating task to insert image for %(identity)s' %
+            {'identity': identity})
+        return self._submit_future(
+            False, self._insert_image, identity, image_url, local_file_path)
+
+    def _insert_image(self, identity, image_url, local_file_path=None):
+        parsed_url = urlparse.urlparse(image_url)
+        local_file = os.path.basename(parsed_url.path)
+        unique = base64.urlsafe_b64encode(os.urandom(6)).decode('utf-8')
+        boot_mode = self.get_boot_mode(identity)
+
+        image_attrs = {
+            'name': '%s %s' % (local_file, unique),
+            'disk_format': 'raw',
+            'container_format': 'bare',
+            'visibility': 'private'
+        }
+        server_metadata = {'sushy-tools-image-url': image_url}
+
+        if boot_mode == 'UEFI':
+            self._logger.debug('Setting UEFI image properties for '
+                               '%(identity)s' % {'identity': identity})
+            image_attrs['properties'] = {
+                'hw_firmware_type': 'uefi',
+                'hw_machine_type': 'q35'
+            }
+
+        if local_file_path:
+            image_attrs['filename'] = local_file_path
+            server_metadata['sushy-tools-image-local-file'] = local_file_path
+
+        image = None
+        try:
+            # Create image, and begin importing. Waiting for import to
+            # complete will be part of a long-running operation
+            image = self._cc.image.create_image(**image_attrs)
+            server_metadata['sushy-tools-import-image'] = image.id
+            if local_file_path:
+                self._logger.debug(
+                    'Uploading image file %(file)s from source %(url)s '
+                    'for %(identity)s' % {'identity': identity,
+                                          'file': local_file_path,
+                                          'url': image_url})
+            else:
+                self._logger.debug(
+                    'Importing image %(url)s for %(identity)s' %
+                    {'identity': identity, 'url': image_url})
+                self._cc.image.import_image(image, method='web-download',
+                                            uri=image_url)
+
+            self._cc.set_server_metadata(identity, server_metadata)
+
+        except Exception as ex:
+            msg = 'Failed insert image from URL %s: %s' % (image_url, ex)
+            self._logger.exception(msg)
+            image_id = image.id if image else None
+            self._attempt_delete_image_local_file(
+                image_id, local_file_path, identity,
+                'sushy-tools-import-image',
+                'sushy-tools-image-local-file')
+            if not isinstance(ex, error.FishyError):
+                ex = error.FishyError(msg)
+            raise ex
+
+        return image.id, image.name
+
+    def eject_image(self, identity):
+        self._logger.debug(
+            'Creating task to eject image for %(identity)s' %
+            {'identity': identity})
+        self._submit_future(False, self._eject_image, identity)
+
+    def _eject_image(self, identity):
+        image_url = None
+        try:
+            server = self._cc.compute.get_server(identity)
+            image_id = server.metadata.get('sushy-tools-import-image')
+            image_url = server.metadata.get('sushy-tools-image-url')
+
+            # sushy-tools-import-image not set in metadata, nothing to do
+            if image_id is None:
+                return
+
+            image = self._cc.image.find_image(image_id)
+
+            if image is None:
+                msg = ('Failed ejecting image %s. Image not found in image '
+                       'service.' % image_url)
+                raise error.FishyError(msg)
+
+            self._attempt_delete_image_local_file(
+                image.id, None, identity,
+                'sushy-tools-import-image', 'sushy-tools-image-url')
+        except Exception as ex:
+            msg = 'Failed eject image from URL %s: %s' % (image_url, ex)
+            self._logger.exception(msg)
+            if not isinstance(ex, error.FishyError):
+                ex = error.FishyError(msg)
+            raise ex
+
+    def _attempt_delete_image_local_file(self, image, local_file, identity,
+                                         *metadata_keys):
+        if image:
+            try:
+                self._logger.debug('Deleting image %(image)s' %
+                                   {'image': image})
+                self._cc.delete_image(image)
+            except Exception:
+                pass
+        if local_file:
+            try:
+                self._logger.debug('Deleting local file %(local_file)s' %
+                                   {'local_file': local_file})
+                self._delete_local_file(local_file)
+            except Exception:
+                pass
+        if identity and metadata_keys:
+            try:
+                self._cc.delete_server_metadata(identity, metadata_keys)
+            except Exception:
+                pass
+
+    def _submit_future(self, run_async, fn, identity, *args, **kwargs):
+        future = self._futures.get(identity, None)
+        if future is not None:
+            if future.running():
+                raise error.Conflict(
+                    'An insert or eject operation is already in progress for '
+                    '%(identity)s' % {'identity': identity})
+
+            ex = future.exception()
+            del self._futures[identity]
+            if ex is not None:
+                # A previous operation failed, and the server may be in an
+                # unknown state. Raise the previous error as an error for
+                # this operation.
+                raise ex
+
+        future = self._executor.submit(fn, identity, *args, **kwargs)
+        self._futures[identity] = future
+        if run_async:
+            return
+        ex = future.exception()
+        if ex is not None:
+            raise ex
+        return future.result()
+
+    def _rebuild_with_imported_image(self, identity, image_id):
+        image_url = None
+        image = None
+        image_local_file = None
+
+        try:
+            image = self._cc.image.get_image(image_id)
+            server = self._cc.compute.get_server(identity)
+            image_url = server.metadata.get('sushy-tools-image-url')
+            image_local_file = server.metadata.get(
+                'sushy-tools-image-local-file')
+
+            # Wait for image to be imported
+            while image.status in ('queued', 'importing'):
+                time.sleep(1)
+                image = self._cc.image.get_image(image)
+
+            if image.status != 'active':
+                raise error.FishyError('Image import ended with status %s' %
+                                       image.status)
+
+            self._logger.debug(
+                'Rebuilding %(identity)s with image %(image)s' %
+                {'identity': identity, 'image': image.id})
+            server = self._cc.compute.rebuild_server(identity, image.id)
+            while server.status == 'REBUILD':
+                server = self._cc.compute.get_server(identity)
+                time.sleep(1)
+            if server.status not in ('ACTIVE', 'SHUTOFF'):
+                raise error.FishyError('Server rebuild attempt resulted in '
+                                       'status %s' % server.status)
+            self._logger.debug(
+                'Rebuild %(identity)s complete' % {'identity': identity})
+
+        except Exception as ex:
+            msg = 'Failed insert image from URL %s: %s' % (image_url, ex)
+            self._logger.exception(msg)
+            self._attempt_delete_image_local_file(
+                image.id, image_local_file, identity,
+                'sushy-tools-import-image', 'sushy-tools-image-local-file')
+            if not isinstance(ex, error.FishyError):
+                ex = error.FishyError(msg)
+            raise ex
+        finally:
+            self._attempt_delete_image_local_file(
+                None, image_local_file, identity,
+                'sushy-tools-image-local-file')
+
+    def _rebuild_with_blank_image(self, identity):
+        image_url = None
+        try:
+            server = self._cc.compute.get_server(identity)
+            image_url = server.metadata.get('sushy-tools-image-url')
+            blank_image = self._config.get(
+                'SUSHY_EMULATOR_OS_VMEDIA_BLANK_IMAGE',
+                'sushy-tools-blank-image')
+            image = self._cc.image.find_image(blank_image)
+
+            if image is None:
+                msg = ('Failed ejecting image %s, vmedia blank image: %s not '
+                       'found.' % (image_url, blank_image))
+                raise error.FishyError(msg)
+
+            self._logger.debug(
+                'Rebuilding %(identity)s with image %(image)s' %
+                {'identity': identity, 'image': image.id})
+            server = self._cc.compute.rebuild_server(identity, image.id)
+
+            while server.status == 'REBUILD':
+                server = self._cc.compute.get_server(identity)
+                time.sleep(1)
+            if server.status not in ('ACTIVE', 'SHUTOFF'):
+                raise error.FishyError('Server rebuild attempt resulted in '
+                                       'status %s' % server.status)
+            self._logger.debug(
+                'Rebuild %(identity)s complete' % {'identity': identity})
+
+        except Exception as ex:
+            msg = 'Failed ejecting image %s: %s' % (image_url, ex)
+            self._logger.exception(msg)
+            if not isinstance(ex, error.FishyError):
+                ex = error.FishyError(msg)
+            raise ex
+
+    @staticmethod
+    def _delete_local_file(local_file):
+        try:
+            os.remove(local_file)
+        except (FileNotFoundError, TypeError):
+            pass
+
+    def _remove_delayed_eject_metadata(self, identity):
+        try:
+            self._cc.delete_server_metadata(identity,
+                                            ['sushy-tools-delay-eject'])
+        except Exception:
+            pass
